@@ -288,6 +288,9 @@ def validate_sql_policy(
             statement_index=index,
             analysis_id=analysis_id,
         )
+        root_category = _BLOCKED_NODE_CATEGORIES.get(root_name)
+        if root_category:
+            _unsafe_node(index, root_category, root_name, analysis_id)
         if root_name not in allowed_roots:
             raise RollbackReadyError(
                 "UNSUPPORTED_SQL",
