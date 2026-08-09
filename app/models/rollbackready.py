@@ -3,7 +3,16 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import (
+    JSON,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -28,6 +37,16 @@ class AnalysisRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    artifact_object_name: Mapped[str | None] = mapped_column(String(512))
+    artifact_generation: Mapped[str | None] = mapped_column(String(64))
+    artifact_state: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="UNAVAILABLE"
+    )
+    artifact_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    row_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    active_operation: Mapped[str | None] = mapped_column(String(32))
+    active_operation_token: Mapped[str | None] = mapped_column(String(64), index=True)
+    operation_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     findings: Mapped[list[FindingRecord]] = relationship(
         cascade="all, delete-orphan", back_populates="analysis"
@@ -164,3 +183,46 @@ class VerificationResultRecord(Base):
     sanitized_error: Mapped[str | None] = mapped_column(Text)
 
     plan: Mapped[RecoveryPlanRecord] = relationship(back_populates="verification")
+
+
+class IdempotencyRecord(Base):
+    __tablename__ = "rollbackready_idempotency"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_clerk_user_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    operation: Mapped[str] = mapped_column(String(100), nullable=False)
+    key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    analysis_id: Mapped[str | None] = mapped_column(String(36))
+    response: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_clerk_user_id",
+            "operation",
+            "key_hash",
+            name="uq_rr_idempotency_owner_operation_key",
+        ),
+    )
+
+
+class RateLimitRecord(Base):
+    __tablename__ = "rollbackready_rate_limits"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scope_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    bucket: Mapped[str] = mapped_column(String(32), nullable=False)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "scope_hash",
+            "bucket",
+            "window_start",
+            name="uq_rr_rate_limit_scope_bucket_window",
+        ),
+    )

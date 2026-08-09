@@ -177,6 +177,11 @@ def load_project_bundle(archive: bytes, candidate_migration: str) -> ProjectBund
 
 
 def load_demo_bundle() -> ProjectBundle:
+    archive_bytes = build_demo_archive()
+    return load_project_bundle(archive_bytes, "20260809100000_add_phone")
+
+
+def build_demo_archive() -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(
@@ -217,7 +222,7 @@ def load_demo_bundle() -> ProjectBundle:
                 ]
             ),
         )
-    return load_project_bundle(buffer.getvalue(), "20260809100000_add_phone")
+    return buffer.getvalue()
 
 
 def _read_safe_zip(archive_bytes: bytes) -> dict[str, bytes]:

@@ -5,9 +5,13 @@ python-dotenv==1.2.2
 cloud-sql-python-connector[pg8000]==1.21.0
 pg8000==1.31.5
 SQLAlchemy==2.0.51
-clerk-backend-api==6.0.1
+cryptography==50.0.0
 google-genai==2.17.0
+google-cloud-storage==3.4.0
 langchain==1.3.14
 langchain-google-genai==4.2.7
 langgraph==1.2.9
+pg-query-python==0.1.3; platform_system != "Windows"
+PyJWT[crypto]==2.10.1
 python-multipart==0.0.32
+sqlglot==30.13.0

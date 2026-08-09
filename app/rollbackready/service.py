@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import hashlib
 import logging
+import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from threading import RLock
 from uuid import uuid4
 
 from app.core.config import settings
+from app.rollbackready.artifacts import ArtifactStore, build_artifact_store
 from app.rollbackready.contracts import (
     AnalysisStatus,
     AnalysisSummary,
@@ -25,8 +29,13 @@ from app.rollbackready.contracts import (
     VerificationResult,
 )
 from app.rollbackready.errors import RollbackReadyError, not_found
-from app.rollbackready.intake import ProjectBundle
-from app.rollbackready.persistence import EvidenceRepository, build_evidence_repository
+from app.rollbackready.intake import ProjectBundle, load_project_bundle
+from app.rollbackready.persistence import (
+    ArtifactReference,
+    EvidenceRepository,
+    IdempotencyDecision,
+    build_evidence_repository,
+)
 from app.rollbackready.planning import RecoveryPlanner
 from app.rollbackready.risk import analyze_risks, confirm_findings_from_execution
 from app.rollbackready.simulation import SimulationEngine, empty_dimensions
@@ -48,6 +57,9 @@ class _Analysis:
     created_at: datetime
     updated_at: datetime
     expires_at: datetime
+    artifact_object_name: str | None = None
+    artifact_generation: str | None = None
+    artifact_expires_at: datetime | None = None
     findings: list[RiskFinding] = field(default_factory=list)
     evidence: list[EvidenceDimension] = field(default_factory=empty_dimensions)
     runs: list[SimulationRun] = field(default_factory=list)
@@ -59,7 +71,7 @@ class _Analysis:
 
 
 class AnalysisService:
-    """Synchronous MVP orchestrator; raw inputs live only in process memory."""
+    """Synchronous orchestrator with durable sanitized and short-lived raw state."""
 
     def __init__(
         self,
@@ -67,15 +79,26 @@ class AnalysisService:
         simulator: SimulationEngine | None = None,
         planner: RecoveryPlanner | None = None,
         repository: EvidenceRepository | None = None,
+        artifact_store: ArtifactStore | None = None,
     ) -> None:
         self._analyses: dict[str, _Analysis] = {}
         self._lock = RLock()
         self._simulator = simulator or SimulationEngine()
         self._planner = planner or RecoveryPlanner()
         self._repository = repository or build_evidence_repository()
+        self._artifact_store = artifact_store or build_artifact_store()
+        self._local_idempotency: dict[
+            tuple[str, str, str], IdempotencyDecision
+        ] = {}
+        self._local_rate_windows: dict[
+            tuple[str, str], deque[float]
+        ] = {}
 
     def create(
-        self, bundle: ProjectBundle, owner_clerk_user_id: str
+        self,
+        bundle: ProjectBundle,
+        owner_clerk_user_id: str,
+        archive: bytes | None = None,
     ) -> AnalysisSummary:
         self.purge_expired()
         now = datetime.now(UTC)
@@ -92,39 +115,63 @@ class AnalysisService:
             updated_at=now,
             expires_at=now + ANALYSIS_RETENTION,
         )
-        self._append_event(record, "BUNDLE_STAGED", "PASS", "Project bundle validated and staged in temporary memory.")
-        with self._lock:
-            active_raw_bundles = sum(
-                item.bundle is not None for item in self._analyses.values()
+        artifact: ArtifactReference | None = None
+        if archive is not None:
+            stored = self._artifact_store.put(analysis_id, archive)
+            record.artifact_object_name = stored.object_name
+            record.artifact_generation = stored.generation
+            record.artifact_expires_at = stored.expires_at
+            artifact = ArtifactReference(
+                object_name=stored.object_name,
+                generation=stored.generation,
+                expires_at=stored.expires_at,
             )
-            if active_raw_bundles >= max(
-                1, settings.rollbackready_max_active_analyses
-            ):
+        self._append_event(
+            record,
+            "BUNDLE_STAGED",
+            "PASS",
+            "Project bundle validated and staged in private short-lived artifact storage.",
+        )
+        with self._lock:
+            unfinished = sum(
+                item.owner_clerk_user_id == owner_clerk_user_id
+                and item.status in {
+                    AnalysisStatus.STAGED,
+                    AnalysisStatus.ANALYZING,
+                    AnalysisStatus.SIMULATING,
+                    AnalysisStatus.PLANNING,
+                    AnalysisStatus.VERIFYING_PLAN,
+                }
+                for item in self._analyses.values()
+            )
+            if unfinished >= max(1, settings.rollbackready_max_unfinished_per_user):
+                self._delete_artifact(record, mark_persisted=False)
                 raise RollbackReadyError(
                     "ANALYSIS_CAPACITY_REACHED",
-                    "This instance has reached its temporary analysis capacity. Retry shortly.",
+                    "This account has reached its unfinished-analysis limit.",
                     status_code=429,
                     details={
-                        "limit": settings.rollbackready_max_active_analyses,
+                        "limit": settings.rollbackready_max_unfinished_per_user,
                     },
                 )
             self._analyses[analysis_id] = record
-        self._persist(record)
+        try:
+            self._create_persisted(record, artifact)
+        except Exception:
+            with self._lock:
+                self._analyses.pop(analysis_id, None)
+            self._delete_artifact(record, mark_persisted=False)
+            raise
         return self._summary(record)
 
     def run(
         self, analysis_id: str, owner_clerk_user_id: str
     ) -> AnalysisSummary:
         record = self._get_record(analysis_id, owner_clerk_user_id)
-        if record.bundle is None:
-            raise RollbackReadyError(
-                "RAW_ARTIFACTS_DELETED",
-                "The raw analysis artifacts have already been deleted.",
-                status_code=409,
-                analysis_id=analysis_id,
-            )
         if record.status not in {AnalysisStatus.STAGED, AnalysisStatus.ERROR}:
             return self._summary(record)
+        self._ensure_bundle(record)
+        operation_token = self._claim_operation(record, "run")
 
         record.status = AnalysisStatus.ANALYZING
         self._touch(record)
@@ -149,7 +196,8 @@ class AnalysisService:
                 "Complete PostgreSQL history, fixtures, and legacy queries are required for verified evidence.",
             )
             self._touch(record)
-            self._persist(record)
+            self._persist(record, operation_token)
+            self._delete_artifact(record)
             return self._summary(record)
 
         record.status = AnalysisStatus.SIMULATING
@@ -168,14 +216,14 @@ class AnalysisService:
                 record.limitations.append(exc.message)
                 self._append_event(record, "SANDBOX_ERROR", "ERROR", exc.message)
                 self._touch(record)
-                self._persist(record)
+                self._persist(record, operation_token)
                 raise
             record.status = AnalysisStatus.ERROR
             record.verdict = Verdict.INSUFFICIENT_EVIDENCE
             record.limitations.append(exc.message)
             self._append_event(record, "SANDBOX_ERROR", "ERROR", exc.message)
             self._touch(record)
-            self._persist(record)
+            self._persist(record, operation_token)
             return self._summary(record)
         except Exception as exc:
             record.status = AnalysisStatus.ERROR
@@ -183,7 +231,7 @@ class AnalysisService:
             record.limitations.append("The sandbox failed before complete evidence could be collected.")
             self._append_event(record, "SANDBOX_ERROR", "ERROR", "The sandbox failed before complete evidence could be collected.")
             self._touch(record)
-            self._persist(record)
+            self._persist(record, operation_token)
             logger.exception(
                 "Disposable PostgreSQL simulation failed for analysis %s",
                 analysis_id,
@@ -225,7 +273,9 @@ class AnalysisService:
             f"Analysis completed with verdict {record.verdict}.",
         )
         self._touch(record)
-        self._persist(record)
+        self._persist(record, operation_token)
+        if not record.findings:
+            self._delete_artifact(record)
         return self._summary(record)
 
     def get(self, analysis_id: str, owner_clerk_user_id: str) -> AnalysisSummary:
@@ -247,6 +297,15 @@ class AnalysisService:
                 status_code=409,
                 analysis_id=analysis_id,
             )
+        if len(record.plans) >= settings.rollbackready_max_plans_per_analysis:
+            raise RollbackReadyError(
+                "PLAN_LIMIT_REACHED",
+                "This analysis has reached its recovery-plan limit.",
+                status_code=429,
+                analysis_id=analysis_id,
+                details={"limit": settings.rollbackready_max_plans_per_analysis},
+            )
+        operation_token = self._claim_operation(record, "plan")
         record.status = AnalysisStatus.PLANNING
         self._append_event(record, "PLAN_GENERATION_STARTED", "RUNNING", "Normalized findings were sent to the constrained recovery planner.")
         try:
@@ -255,11 +314,12 @@ class AnalysisService:
             record.status = AnalysisStatus.PLAN_REJECTED
             self._append_event(record, "PLAN_REJECTED", "FAIL", "No plan passed schema and deterministic policy validation.")
             self._touch(record)
+            self._persist(record, operation_token)
             raise
         record.plans.append(plan)
         self._append_event(record, "PLAN_GENERATED", "PASS", "A structured plan passed schema and SQL-policy validation; it remains unverified.")
         self._touch(record)
-        self._persist(record)
+        self._persist(record, operation_token)
         return plan
 
     def verify_plan(
@@ -274,13 +334,8 @@ class AnalysisService:
                 status_code=404,
                 analysis_id=analysis_id,
             )
-        if record.bundle is None:
-            raise RollbackReadyError(
-                "RAW_ARTIFACTS_DELETED",
-                "The verification artifacts have already been deleted.",
-                status_code=409,
-                analysis_id=analysis_id,
-            )
+        self._ensure_bundle(record)
+        operation_token = self._claim_operation(record, "verify")
         plan_sql = [statement for phase in plan.phases for statement in phase.sql]
         verification_sql = [
             statement
@@ -320,11 +375,15 @@ class AnalysisService:
                 verification_sql,
             )
         except RollbackReadyError as exc:
-            self._restore_after_verification_error(record, plan, exc.message)
+            self._restore_after_verification_error(
+                record, plan, exc.message, operation_token
+            )
             raise
         except Exception as exc:
             message = "Fresh-sandbox plan verification could not complete. Retry the verification."
-            self._restore_after_verification_error(record, plan, message)
+            self._restore_after_verification_error(
+                record, plan, message, operation_token
+            )
             raise RollbackReadyError(
                 "PLAN_VERIFICATION_ERROR",
                 message,
@@ -372,9 +431,9 @@ class AnalysisService:
         self._append_event(record, "PLAN_VERIFICATION_COMPLETED", event_status, event_message)
         # The complete analysis/verification lifecycle is terminal. Only hashes,
         # normalized findings, generated SQL, and sanitized evidence remain.
-        record.bundle = None
         self._touch(record)
-        self._persist(record)
+        self._persist(record, operation_token)
+        self._delete_artifact(record)
         return result
 
     def _restore_after_verification_error(
@@ -382,13 +441,14 @@ class AnalysisService:
         record: _Analysis,
         plan: RecoveryPlan,
         message: str,
+        operation_token: str,
     ) -> None:
         """Keep a transient verifier failure retryable and accurately reported."""
         plan.state = PlanState.UNVERIFIED_CANDIDATE
         record.status = _status_for_verdict(record.verdict)
         self._append_event(record, "PLAN_VERIFICATION_ERROR", "ERROR", message)
         self._touch(record)
-        self._persist(record)
+        self._persist(record, operation_token)
 
     def report(self, analysis_id: str, owner_clerk_user_id: str) -> EvidenceReport:
         record = self._get_record(analysis_id, owner_clerk_user_id)
@@ -399,6 +459,7 @@ class AnalysisService:
         )
 
     def delete(self, analysis_id: str, owner_clerk_user_id: str) -> None:
+        persisted = self._repository.get(analysis_id, owner_clerk_user_id)
         with self._lock:
             record = self._analyses.get(analysis_id)
             if record is not None and record.owner_clerk_user_id != owner_clerk_user_id:
@@ -406,11 +467,24 @@ class AnalysisService:
             if record is not None:
                 self._analyses.pop(analysis_id, None)
         if record is None:
-            if self._repository.get(analysis_id, owner_clerk_user_id) is None:
+            if persisted is None:
                 raise not_found(analysis_id)
-        else:
-            record.bundle = None
+            summary = persisted.analysis
+            record = _Analysis(
+                id=summary.id,
+                owner_clerk_user_id=owner_clerk_user_id,
+                manifest=summary.manifest,
+                bundle=None,
+                status=summary.status,
+                evidence_level=summary.evidence_level,
+                verdict=summary.verdict,
+                created_at=summary.created_at,
+                updated_at=summary.updated_at,
+                expires_at=summary.expires_at,
+            )
+            self._load_artifact_reference(record)
         self._repository.delete(analysis_id, owner_clerk_user_id)
+        self._delete_artifact(record, mark_persisted=False)
 
     def purge_expired(self, now: datetime | None = None) -> int:
         """Delete expired raw bundles and sanitized reports without an access trigger."""
@@ -424,7 +498,7 @@ class AnalysisService:
             for analysis_id, _ in expired:
                 self._analyses.pop(analysis_id, None)
         for analysis_id, record in expired:
-            record.bundle = None
+            self._delete_artifact(record, mark_persisted=False)
             try:
                 self._repository.delete(
                     analysis_id,
@@ -447,10 +521,52 @@ class AnalysisService:
         self, analysis_id: str, owner_clerk_user_id: str
     ) -> _Analysis:
         with self._lock:
-            record = self._analyses.get(analysis_id)
+            cached = self._analyses.get(analysis_id)
+        record = cached
         if record is not None and record.owner_clerk_user_id != owner_clerk_user_id:
             raise not_found(analysis_id)
-        if record is None:
+        authoritative = bool(getattr(self._repository, "authoritative", False))
+        persisted = (
+            self._repository.get(analysis_id, owner_clerk_user_id)
+            if authoritative or record is None
+            else None
+        )
+
+        if authoritative and persisted is None:
+            with self._lock:
+                self._analyses.pop(analysis_id, None)
+            raise not_found(analysis_id)
+        if persisted is not None:
+            summary = persisted.analysis
+            cached_bundle = (
+                cached.bundle
+                if cached is not None and summary.raw_artifacts_available
+                else None
+            )
+            record = _Analysis(
+                id=summary.id,
+                owner_clerk_user_id=owner_clerk_user_id,
+                manifest=summary.manifest,
+                bundle=cached_bundle,
+                status=summary.status,
+                evidence_level=summary.evidence_level,
+                verdict=summary.verdict,
+                created_at=summary.created_at,
+                updated_at=summary.updated_at,
+                expires_at=summary.expires_at,
+                findings=list(summary.findings),
+                evidence=list(summary.evidence),
+                runs=list(summary.simulation_runs),
+                legacy_results=list(summary.legacy_query_results),
+                timeline=list(persisted.timeline),
+                plans=list(summary.plans),
+                verifications=list(summary.verification_results),
+                limitations=list(summary.limitations),
+            )
+            self._load_artifact_reference(record)
+            with self._lock:
+                self._analyses[analysis_id] = record
+        elif record is None:
             persisted = self._repository.get(analysis_id, owner_clerk_user_id)
             if persisted is None:
                 raise not_found(analysis_id)
@@ -490,6 +606,109 @@ class AnalysisService:
             )
         return record
 
+    def begin_idempotency(
+        self, owner_clerk_user_id: str, operation: str, key: str
+    ) -> tuple[str, dict | None, str]:
+        key_hash = hashlib.sha256(key.encode()).hexdigest()
+        if not bool(getattr(self._repository, "authoritative", False)):
+            local_key = (owner_clerk_user_id, operation, key_hash)
+            with self._lock:
+                decision = self._local_idempotency.get(local_key)
+                if decision is None:
+                    decision = IdempotencyDecision("IN_PROGRESS")
+                    self._local_idempotency[local_key] = decision
+                    return "NEW", None, key_hash
+                return decision.state, decision.response, key_hash
+        begin = getattr(self._repository, "begin_idempotency", None)
+        decision = (
+            begin(owner_clerk_user_id, operation, key_hash)
+            if begin is not None
+            else IdempotencyDecision("NEW")
+        )
+        return decision.state, decision.response, key_hash
+
+    def finish_idempotency(
+        self,
+        owner_clerk_user_id: str,
+        operation: str,
+        key_hash: str,
+        analysis_id: str,
+        response: dict,
+    ) -> None:
+        if not bool(getattr(self._repository, "authoritative", False)):
+            with self._lock:
+                self._local_idempotency[
+                    (owner_clerk_user_id, operation, key_hash)
+                ] = IdempotencyDecision("COMPLETE", response)
+            return
+        finish = getattr(self._repository, "finish_idempotency", None)
+        if finish is not None:
+            finish(
+                owner_clerk_user_id,
+                operation,
+                key_hash,
+                analysis_id,
+                response,
+            )
+
+    def abort_idempotency(
+        self, owner_clerk_user_id: str, operation: str, key_hash: str
+    ) -> None:
+        if not bool(getattr(self._repository, "authoritative", False)):
+            with self._lock:
+                self._local_idempotency.pop(
+                    (owner_clerk_user_id, operation, key_hash), None
+                )
+            return
+        abort = getattr(self._repository, "abort_idempotency", None)
+        if abort is not None:
+            abort(owner_clerk_user_id, operation, key_hash)
+
+    def check_rate_limit(
+        self,
+        owner_clerk_user_id: str,
+        bucket: str,
+        limit: int,
+        window_seconds: int,
+        client: str = "",
+    ) -> None:
+        del client
+        scope = hashlib.sha256(owner_clerk_user_id.encode()).hexdigest()
+        if not bool(getattr(self._repository, "authoritative", False)):
+            now = time.monotonic()
+            key = (scope, bucket)
+            with self._lock:
+                entries = self._local_rate_windows.setdefault(key, deque())
+                cutoff = now - window_seconds
+                while entries and entries[0] <= cutoff:
+                    entries.popleft()
+                if len(entries) >= limit:
+                    retry_after = max(1, int(entries[0] + window_seconds - now) + 1)
+                else:
+                    entries.append(now)
+                    retry_after = None
+            if retry_after is not None:
+                raise RollbackReadyError(
+                    "RATE_LIMITED",
+                    "This operation has reached its account quota. Retry later.",
+                    status_code=429,
+                    details={"retry_after_seconds": retry_after},
+                )
+            return
+        consume = getattr(self._repository, "consume_rate_limit", None)
+        retry_after = (
+            consume(scope, bucket, limit, window_seconds)
+            if consume is not None
+            else None
+        )
+        if retry_after is not None:
+            raise RollbackReadyError(
+                "RATE_LIMITED",
+                "This operation has reached its account quota. Retry later.",
+                status_code=429,
+                details={"retry_after_seconds": retry_after},
+            )
+
     @staticmethod
     def _summary(record: _Analysis) -> AnalysisSummary:
         return AnalysisSummary(
@@ -502,6 +721,13 @@ class AnalysisService:
             created_at=record.created_at,
             updated_at=record.updated_at,
             expires_at=record.expires_at,
+            raw_artifacts_available=bool(
+                (record.bundle is not None or record.artifact_object_name)
+                and (
+                    record.artifact_expires_at is None
+                    or record.artifact_expires_at > datetime.now(UTC)
+                )
+            ),
             manifest=record.manifest,
             findings=list(record.findings),
             evidence=list(record.evidence),
@@ -516,20 +742,144 @@ class AnalysisService:
     def _touch(record: _Analysis) -> None:
         record.updated_at = datetime.now(UTC)
 
-    def _persist(self, record: _Analysis) -> None:
+    def _persist(
+        self, record: _Analysis, operation_token: str | None = None
+    ) -> None:
+        report = EvidenceReport(
+            analysis=self._summary(record),
+            timeline=list(record.timeline),
+            generated_at=datetime.now(UTC),
+        )
         try:
-            self._repository.save(
-                EvidenceReport(
-                    analysis=self._summary(record),
-                    timeline=list(record.timeline),
-                    generated_at=datetime.now(UTC),
-                ),
-                record.owner_clerk_user_id,
-            )
-        except Exception:  # noqa: BLE001 -- analysis evidence remains available in memory
+            update_record = getattr(self._repository, "update", None)
+            if update_record is None:
+                self._repository.save(report, record.owner_clerk_user_id)
+                saved = True
+            else:
+                saved = update_record(
+                    report,
+                    record.owner_clerk_user_id,
+                    operation_token,
+                )
+            if not saved:
+                with self._lock:
+                    self._analyses.pop(record.id, None)
+                raise not_found(record.id)
+        except RollbackReadyError:
+            raise
+        except Exception as exc:
+            if bool(getattr(self._repository, "authoritative", False)):
+                raise RollbackReadyError(
+                    "PERSISTENCE_UNAVAILABLE",
+                    "The analysis result could not be stored durably. Retry later.",
+                    status_code=503,
+                    analysis_id=record.id,
+                ) from exc
             message = "Sanitized report persistence is temporarily unavailable."
             if message not in record.limitations:
                 record.limitations.append(message)
+
+    def _create_persisted(
+        self,
+        record: _Analysis,
+        artifact: ArtifactReference | None,
+    ) -> None:
+        report = EvidenceReport(
+            analysis=self._summary(record),
+            timeline=list(record.timeline),
+            generated_at=datetime.now(UTC),
+        )
+        create_record = getattr(self._repository, "create", None)
+        if create_record is None:
+            self._repository.save(report, record.owner_clerk_user_id)
+            return
+        if not create_record(report, record.owner_clerk_user_id, artifact):
+            self._delete_artifact(record, mark_persisted=False)
+            raise RollbackReadyError(
+                "ANALYSIS_CONFLICT",
+                "The analysis could not be created safely.",
+                status_code=409,
+                analysis_id=record.id,
+            )
+
+    def _claim_operation(self, record: _Analysis, operation: str) -> str:
+        token = uuid4().hex
+        claim = getattr(self._repository, "claim_operation", None)
+        if claim is not None and not claim(
+            record.id,
+            record.owner_clerk_user_id,
+            operation,
+            token,
+            datetime.now(UTC),
+        ):
+            if self._repository.get(record.id, record.owner_clerk_user_id) is None:
+                raise not_found(record.id)
+            raise RollbackReadyError(
+                "OPERATION_IN_PROGRESS",
+                "Another operation is already running for this analysis.",
+                status_code=409,
+                analysis_id=record.id,
+            )
+        return token
+
+    def _load_artifact_reference(self, record: _Analysis) -> None:
+        getter = getattr(self._repository, "get_artifact", None)
+        reference = (
+            getter(record.id, record.owner_clerk_user_id)
+            if getter is not None
+            else None
+        )
+        if reference is not None:
+            record.artifact_object_name = reference.object_name
+            record.artifact_generation = reference.generation
+            record.artifact_expires_at = reference.expires_at
+
+    def _ensure_bundle(self, record: _Analysis) -> None:
+        if record.bundle is not None:
+            return
+        self._load_artifact_reference(record)
+        if (
+            record.artifact_expires_at is not None
+            and record.artifact_expires_at <= datetime.now(UTC)
+        ):
+            self._delete_artifact(record)
+            raise RollbackReadyError(
+                "RAW_ARTIFACTS_DELETED",
+                "The raw analysis artifacts are no longer available.",
+                status_code=409,
+                analysis_id=record.id,
+            )
+        if not record.artifact_object_name or not record.artifact_generation:
+            raise RollbackReadyError(
+                "RAW_ARTIFACTS_DELETED",
+                "The raw analysis artifacts are no longer available.",
+                status_code=409,
+                analysis_id=record.id,
+            )
+        archive = self._artifact_store.get(
+            record.artifact_object_name,
+            record.artifact_generation,
+        )
+        record.bundle = load_project_bundle(
+            archive,
+            record.manifest.candidate_migration,
+        )
+
+    def _delete_artifact(
+        self, record: _Analysis, *, mark_persisted: bool = True
+    ) -> None:
+        if record.artifact_object_name:
+            self._artifact_store.delete(
+                record.artifact_object_name,
+                record.artifact_generation,
+            )
+        record.bundle = None
+        record.artifact_object_name = None
+        record.artifact_generation = None
+        record.artifact_expires_at = None
+        marker = getattr(self._repository, "mark_artifact_deleted", None)
+        if mark_persisted and marker is not None:
+            marker(record.id, record.owner_clerk_user_id)
 
     @staticmethod
     def _append_event(

@@ -40,23 +40,20 @@ python -m app
 
 The service listens on `PORT` or `8080` by default.
 
-The default hackathon access mode is anonymous and uses possession of the
-opaque analysis UUID as its boundary. When Clerk credentials are configured,
-requests are associated with the authenticated Clerk subject and reports are
-owner-isolated. Set `CLERK_AUTH_REQUIRED=true` only after the frontend session
-integration is configured; otherwise the built-in demo remains available under
-the reserved anonymous owner.
+Every `/api/v1` operation requires a valid Clerk session JWT. Configure the
+pinned Clerk RS256 public key, issuer, and authorized frontend parties before
+starting the product API. Missing auth configuration fails closed with `503`;
+missing or invalid sessions return `401`, and ownership mismatches return `404`.
 
 Set `ROLLBACKREADY_SANDBOX_BACKEND=docker` on Windows or macOS to use the
 network-isolated `postgres:18-alpine` development sandbox. The deployed image
 contains native PostgreSQL 18 binaries and listens only on a Unix socket.
 
-Raw project bundles intentionally remain process-local and are deleted after
-the analysis/verification lifecycle. A container or pod replacement can
-therefore interrupt a staged or unverified analysis. The single-instance MVP
-settings reduce routing risk but do not make the lifecycle restart-safe;
-isolated asynchronous workers and encrypted temporary artifact storage remain
-production-roadmap work.
+Cloud SQL is authoritative for analysis state. Raw project bundles use private,
+generation-checked temporary object storage shared by both runtimes and are
+deleted after verification, deletion, or expiry. Capacity intentionally remains
+one synchronous simulator per runtime; this release does not claim 1,000-user
+analysis capacity.
 
 The accepted ZIP layout is documented in
 [`docs/rollbackready-prd.md`](docs/rollbackready-prd.md). Never put

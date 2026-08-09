@@ -44,11 +44,11 @@ def test_process_environment_takes_precedence_over_dotenv(
 def test_clerk_and_vertex_settings_are_parsed(monkeypatch) -> None:
     monkeypatch.setenv("CLERK_SECRET_KEY", "test-secret")
     monkeypatch.setenv("CLERK_JWT_KEY", "test-jwt")
+    monkeypatch.setenv("CLERK_ISSUER", "https://issuer.example")
     monkeypatch.setenv(
         "CLERK_AUTHORIZED_PARTIES",
         "https://app.example.com, https://admin.example.com,",
     )
-    monkeypatch.setenv("CLERK_AUTH_REQUIRED", "true")
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
     monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "global")
     monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
@@ -58,11 +58,11 @@ def test_clerk_and_vertex_settings_are_parsed(monkeypatch) -> None:
 
     assert configured.clerk_secret_key == "test-secret"
     assert configured.clerk_jwt_key == "test-jwt"
+    assert configured.clerk_issuer == "https://issuer.example"
     assert configured.clerk_authorized_parties == (
         "https://app.example.com",
         "https://admin.example.com",
     )
-    assert configured.clerk_auth_required is True
     assert configured.google_cloud_project == "test-project"
     assert configured.google_cloud_location == "global"
     assert configured.google_genai_use_vertexai is True

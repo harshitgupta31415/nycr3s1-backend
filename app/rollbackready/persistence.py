@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from sqlalchemy import delete as sql_delete
-from sqlalchemy import select
+from sqlalchemy import func, or_, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, selectinload
 
@@ -14,7 +17,9 @@ from app.core.database import get_database_engine
 from app.models.rollbackready import (
     AnalysisRecord,
     FindingRecord,
+    IdempotencyRecord,
     LegacyQueryResultRecord,
+    RateLimitRecord,
     RecoveryPlanRecord,
     SimulationRunRecord,
     TimelineEventRecord,
@@ -33,10 +38,44 @@ from app.rollbackready.contracts import (
     TimelineEvent,
     VerificationResult,
 )
+from app.rollbackready.errors import RollbackReadyError
+
+_UNFINISHED_STATUSES = {
+    "STAGED",
+    "ANALYZING",
+    "SIMULATING",
+    "PLANNING",
+    "VERIFYING_PLAN",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactReference:
+    object_name: str
+    generation: str
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class IdempotencyDecision:
+    state: str
+    response: dict | None = None
 
 
 class EvidenceRepository(Protocol):
-    def save(self, report: EvidenceReport, owner_clerk_user_id: str) -> None: ...
+    def create(
+        self,
+        report: EvidenceReport,
+        owner_clerk_user_id: str,
+        artifact: ArtifactReference | None = None,
+    ) -> bool: ...
+
+    def update(
+        self,
+        report: EvidenceReport,
+        owner_clerk_user_id: str,
+        operation_token: str | None = None,
+    ) -> bool: ...
 
     def get(
         self, analysis_id: str, owner_clerk_user_id: str
@@ -46,8 +85,68 @@ class EvidenceRepository(Protocol):
 
     def delete_expired(self, expired_before: datetime) -> None: ...
 
+    def get_artifact(
+        self, analysis_id: str, owner_clerk_user_id: str
+    ) -> ArtifactReference | None: ...
+
+    def claim_operation(
+        self,
+        analysis_id: str,
+        owner_clerk_user_id: str,
+        operation: str,
+        token: str,
+        started_at: datetime,
+    ) -> bool: ...
+
+    def mark_artifact_deleted(
+        self, analysis_id: str, owner_clerk_user_id: str
+    ) -> None: ...
+
+    def begin_idempotency(
+        self, owner_clerk_user_id: str, operation: str, key_hash: str
+    ) -> IdempotencyDecision: ...
+
+    def finish_idempotency(
+        self,
+        owner_clerk_user_id: str,
+        operation: str,
+        key_hash: str,
+        analysis_id: str,
+        response: dict,
+    ) -> None: ...
+
+    def abort_idempotency(
+        self, owner_clerk_user_id: str, operation: str, key_hash: str
+    ) -> None: ...
+
+    def consume_rate_limit(
+        self,
+        scope_hash: str,
+        bucket: str,
+        limit: int,
+        window_seconds: int,
+    ) -> int | None: ...
+
 
 class NullEvidenceRepository:
+    authoritative = False
+
+    def create(
+        self,
+        report: EvidenceReport,
+        owner_clerk_user_id: str,
+        artifact: ArtifactReference | None = None,
+    ) -> bool:
+        return True
+
+    def update(
+        self,
+        report: EvidenceReport,
+        owner_clerk_user_id: str,
+        operation_token: str | None = None,
+    ) -> bool:
+        return True
+
     def save(self, report: EvidenceReport, owner_clerk_user_id: str) -> None:
         return None
 
@@ -62,41 +161,150 @@ class NullEvidenceRepository:
     def delete_expired(self, expired_before: datetime) -> None:
         return None
 
+    def get_artifact(
+        self, analysis_id: str, owner_clerk_user_id: str
+    ) -> ArtifactReference | None:
+        return None
+
+    def claim_operation(
+        self,
+        analysis_id: str,
+        owner_clerk_user_id: str,
+        operation: str,
+        token: str,
+        started_at: datetime,
+    ) -> bool:
+        return True
+
+    def mark_artifact_deleted(
+        self, analysis_id: str, owner_clerk_user_id: str
+    ) -> None:
+        return None
+
+    def begin_idempotency(
+        self, owner_clerk_user_id: str, operation: str, key_hash: str
+    ) -> IdempotencyDecision:
+        return IdempotencyDecision("NEW")
+
+    def finish_idempotency(
+        self,
+        owner_clerk_user_id: str,
+        operation: str,
+        key_hash: str,
+        analysis_id: str,
+        response: dict,
+    ) -> None:
+        return None
+
+    def abort_idempotency(
+        self, owner_clerk_user_id: str, operation: str, key_hash: str
+    ) -> None:
+        return None
+
+    def consume_rate_limit(
+        self,
+        scope_hash: str,
+        bucket: str,
+        limit: int,
+        window_seconds: int,
+    ) -> int | None:
+        return None
+
 
 class SqlAlchemyEvidenceRepository:
     """Replace sanitized evidence atomically; raw artifacts never enter this layer."""
 
+    authoritative = True
+
     def __init__(self, engine_factory: Callable[[], Engine] = get_database_engine) -> None:
         self._engine_factory = engine_factory
 
-    def save(self, report: EvidenceReport, owner_clerk_user_id: str) -> None:
+    def save(
+        self,
+        report: EvidenceReport,
+        owner_clerk_user_id: str,
+        *,
+        create_if_missing: bool = True,
+        operation_token: str | None = None,
+        artifact: ArtifactReference | None = None,
+    ) -> bool:
         summary = report.analysis
         with Session(self._engine_factory()) as session, session.begin():
+            if create_if_missing:
+                lock_id = int.from_bytes(
+                    hashlib.sha256(owner_clerk_user_id.encode()).digest()[:8],
+                    byteorder="big",
+                    signed=True,
+                )
+                session.execute(select(func.pg_advisory_xact_lock(lock_id)))
             existing = session.scalar(
-                select(AnalysisRecord).where(
+                select(AnalysisRecord)
+                .where(
                     AnalysisRecord.id == summary.id,
                     AnalysisRecord.owner_clerk_user_id == owner_clerk_user_id,
                 )
+                .with_for_update()
             )
+            if existing is None and not create_if_missing:
+                return False
+            if existing is None and create_if_missing:
+                unfinished = session.scalar(
+                    select(func.count())
+                    .select_from(AnalysisRecord)
+                    .where(
+                        AnalysisRecord.owner_clerk_user_id
+                        == owner_clerk_user_id,
+                        AnalysisRecord.status.in_(_UNFINISHED_STATUSES),
+                    )
+                )
+                if (unfinished or 0) >= max(
+                    1, settings.rollbackready_max_unfinished_per_user
+                ):
+                    raise RollbackReadyError(
+                        "ANALYSIS_CAPACITY_REACHED",
+                        "This account has reached its unfinished-analysis limit.",
+                        status_code=429,
+                        details={
+                            "limit": settings.rollbackready_max_unfinished_per_user,
+                        },
+                    )
+            if (
+                existing is not None
+                and operation_token is not None
+                and existing.active_operation_token != operation_token
+            ):
+                return False
+            analysis = existing or AnalysisRecord(id=summary.id)
+            analysis.owner_clerk_user_id = owner_clerk_user_id
+            analysis.status = summary.status
+            analysis.evidence_level = summary.evidence_level
+            analysis.verdict = summary.verdict
+            analysis.input_hash = summary.manifest.archive_sha256
+            analysis.provider = summary.provider
+            analysis.candidate_migration = summary.candidate_migration
+            analysis.manifest = summary.manifest.model_dump(mode="json")
+            analysis.evidence = [item.model_dump(mode="json") for item in summary.evidence]
+            analysis.limitations = summary.limitations
+            analysis.created_at = summary.created_at
+            analysis.updated_at = summary.updated_at
+            analysis.expires_at = summary.expires_at
+            analysis.row_version = (analysis.row_version or 0) + 1
+            if artifact is not None:
+                analysis.artifact_object_name = artifact.object_name
+                analysis.artifact_generation = artifact.generation
+                analysis.artifact_state = "AVAILABLE"
+                analysis.artifact_expires_at = artifact.expires_at
             if existing is not None:
-                session.delete(existing)
+                analysis.findings.clear()
+                analysis.simulation_runs.clear()
+                analysis.legacy_results.clear()
+                analysis.timeline_events.clear()
+                analysis.recovery_plans.clear()
                 session.flush()
-            analysis = AnalysisRecord(
-                id=summary.id,
-                owner_clerk_user_id=owner_clerk_user_id,
-                status=summary.status,
-                evidence_level=summary.evidence_level,
-                verdict=summary.verdict,
-                input_hash=summary.manifest.archive_sha256,
-                provider=summary.provider,
-                candidate_migration=summary.candidate_migration,
-                manifest=summary.manifest.model_dump(mode="json"),
-                evidence=[item.model_dump(mode="json") for item in summary.evidence],
-                limitations=summary.limitations,
-                created_at=summary.created_at,
-                updated_at=summary.updated_at,
-                expires_at=summary.expires_at,
-            )
+            if operation_token is not None:
+                analysis.active_operation = None
+                analysis.active_operation_token = None
+                analysis.operation_started_at = None
             analysis.findings = [
                 FindingRecord(
                     id=item.id,
@@ -179,6 +387,33 @@ class SqlAlchemyEvidenceRepository:
                     )
                 analysis.recovery_plans.append(plan_record)
             session.add(analysis)
+        return True
+
+    def create(
+        self,
+        report: EvidenceReport,
+        owner_clerk_user_id: str,
+        artifact: ArtifactReference | None = None,
+    ) -> bool:
+        return self.save(
+            report,
+            owner_clerk_user_id,
+            create_if_missing=True,
+            artifact=artifact,
+        )
+
+    def update(
+        self,
+        report: EvidenceReport,
+        owner_clerk_user_id: str,
+        operation_token: str | None = None,
+    ) -> bool:
+        return self.save(
+            report,
+            owner_clerk_user_id,
+            create_if_missing=False,
+            operation_token=operation_token,
+        )
 
     def get(
         self, analysis_id: str, owner_clerk_user_id: str
@@ -229,6 +464,7 @@ class SqlAlchemyEvidenceRepository:
                 created_at=record.created_at,
                 updated_at=record.updated_at,
                 expires_at=record.expires_at,
+                raw_artifacts_available=record.artifact_state == "AVAILABLE",
                 manifest=ArtifactManifest.model_validate(record.manifest),
                 findings=[
                     RiskFinding(
@@ -296,6 +532,193 @@ class SqlAlchemyEvidenceRepository:
                 analysis=summary,
                 timeline=timeline,
                 generated_at=record.updated_at,
+            )
+
+    def get_artifact(
+        self, analysis_id: str, owner_clerk_user_id: str
+    ) -> ArtifactReference | None:
+        with Session(self._engine_factory()) as session:
+            record = session.scalar(
+                select(AnalysisRecord).where(
+                    AnalysisRecord.id == analysis_id,
+                    AnalysisRecord.owner_clerk_user_id == owner_clerk_user_id,
+                )
+            )
+            if (
+                record is None
+                or record.artifact_state != "AVAILABLE"
+                or not record.artifact_object_name
+                or not record.artifact_generation
+                or record.artifact_expires_at is None
+            ):
+                return None
+            return ArtifactReference(
+                object_name=record.artifact_object_name,
+                generation=record.artifact_generation,
+                expires_at=record.artifact_expires_at,
+            )
+
+    def begin_idempotency(
+        self, owner_clerk_user_id: str, operation: str, key_hash: str
+    ) -> IdempotencyDecision:
+        now = datetime.now(UTC)
+        with Session(self._engine_factory()) as session, session.begin():
+            inserted = session.scalar(
+                pg_insert(IdempotencyRecord)
+                .values(
+                    owner_clerk_user_id=owner_clerk_user_id,
+                    operation=operation,
+                    key_hash=key_hash,
+                    state="IN_PROGRESS",
+                    created_at=now,
+                    expires_at=now + timedelta(hours=24),
+                )
+                .on_conflict_do_nothing(
+                    constraint="uq_rr_idempotency_owner_operation_key"
+                )
+                .returning(IdempotencyRecord.id)
+            )
+            if inserted is not None:
+                return IdempotencyDecision("NEW")
+            record = session.scalar(
+                select(IdempotencyRecord)
+                .where(
+                    IdempotencyRecord.owner_clerk_user_id == owner_clerk_user_id,
+                    IdempotencyRecord.operation == operation,
+                    IdempotencyRecord.key_hash == key_hash,
+                )
+                .with_for_update()
+            )
+            if record is None:
+                raise RuntimeError("idempotency record disappeared during claim")
+            if record.expires_at <= now:
+                record.state = "IN_PROGRESS"
+                record.analysis_id = None
+                record.response = None
+                record.created_at = now
+                record.expires_at = now + timedelta(hours=24)
+                return IdempotencyDecision("NEW")
+            if record.state == "COMPLETE" and record.response is not None:
+                return IdempotencyDecision("COMPLETE", dict(record.response))
+            return IdempotencyDecision("IN_PROGRESS")
+
+    def finish_idempotency(
+        self,
+        owner_clerk_user_id: str,
+        operation: str,
+        key_hash: str,
+        analysis_id: str,
+        response: dict,
+    ) -> None:
+        with Session(self._engine_factory()) as session, session.begin():
+            session.execute(
+                update(IdempotencyRecord)
+                .where(
+                    IdempotencyRecord.owner_clerk_user_id == owner_clerk_user_id,
+                    IdempotencyRecord.operation == operation,
+                    IdempotencyRecord.key_hash == key_hash,
+                    IdempotencyRecord.state == "IN_PROGRESS",
+                )
+                .values(
+                    state="COMPLETE",
+                    analysis_id=analysis_id,
+                    response=response,
+                )
+            )
+
+    def abort_idempotency(
+        self, owner_clerk_user_id: str, operation: str, key_hash: str
+    ) -> None:
+        with Session(self._engine_factory()) as session, session.begin():
+            session.execute(
+                sql_delete(IdempotencyRecord).where(
+                    IdempotencyRecord.owner_clerk_user_id == owner_clerk_user_id,
+                    IdempotencyRecord.operation == operation,
+                    IdempotencyRecord.key_hash == key_hash,
+                    IdempotencyRecord.state == "IN_PROGRESS",
+                )
+            )
+
+    def consume_rate_limit(
+        self,
+        scope_hash: str,
+        bucket: str,
+        limit: int,
+        window_seconds: int,
+    ) -> int | None:
+        now = datetime.now(UTC)
+        epoch = int(now.timestamp())
+        window_epoch = epoch - (epoch % window_seconds)
+        window_start = datetime.fromtimestamp(window_epoch, UTC)
+        expires_at = window_start + timedelta(seconds=window_seconds * 2)
+        statement = (
+            pg_insert(RateLimitRecord)
+            .values(
+                scope_hash=scope_hash,
+                bucket=bucket,
+                window_start=window_start,
+                count=1,
+                expires_at=expires_at,
+            )
+            .on_conflict_do_update(
+                constraint="uq_rr_rate_limit_scope_bucket_window",
+                set_={"count": RateLimitRecord.count + 1},
+                where=RateLimitRecord.count < max(1, limit),
+            )
+            .returning(RateLimitRecord.count)
+        )
+        with Session(self._engine_factory()) as session, session.begin():
+            count = session.scalar(statement)
+        if count is not None:
+            return None
+        return max(1, window_seconds - (epoch - window_epoch))
+
+    def claim_operation(
+        self,
+        analysis_id: str,
+        owner_clerk_user_id: str,
+        operation: str,
+        token: str,
+        started_at: datetime,
+    ) -> bool:
+        with Session(self._engine_factory()) as session, session.begin():
+            result = session.execute(
+                update(AnalysisRecord)
+                .where(
+                    AnalysisRecord.id == analysis_id,
+                    AnalysisRecord.owner_clerk_user_id == owner_clerk_user_id,
+                    or_(
+                        AnalysisRecord.active_operation_token.is_(None),
+                        AnalysisRecord.operation_started_at
+                        < started_at - timedelta(minutes=10),
+                    ),
+                )
+                .values(
+                    active_operation=operation,
+                    active_operation_token=token,
+                    operation_started_at=started_at,
+                    row_version=AnalysisRecord.row_version + 1,
+                )
+            )
+            return bool(result.rowcount)
+
+    def mark_artifact_deleted(
+        self, analysis_id: str, owner_clerk_user_id: str
+    ) -> None:
+        with Session(self._engine_factory()) as session, session.begin():
+            session.execute(
+                update(AnalysisRecord)
+                .where(
+                    AnalysisRecord.id == analysis_id,
+                    AnalysisRecord.owner_clerk_user_id == owner_clerk_user_id,
+                )
+                .values(
+                    artifact_state="DELETED",
+                    artifact_object_name=None,
+                    artifact_generation=None,
+                    artifact_expires_at=None,
+                    row_version=AnalysisRecord.row_version + 1,
+                )
             )
 
     def delete(self, analysis_id: str, owner_clerk_user_id: str) -> None:

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
+import re
+import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from typing import Any
+from uuid import uuid4
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -19,6 +24,7 @@ from app.routers.health import create_health_router
 from app.routers.root import router as root_router
 
 DatabaseCheck = Callable[[], dict[str, Any]]
+logger = logging.getLogger("rollbackready.request")
 
 
 def create_app(
@@ -47,9 +53,36 @@ def create_app(
     application = FastAPI(
         title="RollbackReady API",
         description="Verified migration recovery evidence for Prisma PostgreSQL projects.",
-        version="0.3.0",
+        version="0.4.0",
         lifespan=lifespan,
     )
+
+    @application.middleware("http")
+    async def request_context(request: Request, call_next):
+        supplied = request.headers.get("x-request-id", "")
+        request_id = (
+            supplied
+            if re.fullmatch(r"[A-Za-z0-9_-]{8,64}", supplied)
+            else uuid4().hex
+        )
+        request.state.request_id = request_id
+        started = time.monotonic()
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        logger.info(
+            json.dumps(
+                {
+                    "event": "request_complete",
+                    "request_id": request_id,
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status": response.status_code,
+                    "duration_ms": round((time.monotonic() - started) * 1000),
+                },
+                separators=(",", ":"),
+            )
+        )
+        return response
 
     if settings.cors_origins:
         application.add_middleware(
@@ -68,13 +101,14 @@ def create_app(
 
     @application.exception_handler(RollbackReadyError)
     async def rollbackready_error_handler(
-        _: Request, exc: RollbackReadyError
+        request: Request, exc: RollbackReadyError
     ) -> JSONResponse:
         payload = ErrorEnvelope(
             error=ErrorDetail(
                 code=exc.code,
                 message=exc.message,
                 analysis_id=exc.analysis_id,
+                request_id=getattr(request.state, "request_id", None),
                 details=exc.details,
             )
         )
@@ -86,6 +120,26 @@ def create_app(
             status_code=exc.status_code,
             content=payload.model_dump(mode="json"),
             headers=headers,
+        )
+
+    @application.exception_handler(HTTPException)
+    async def http_error_handler(request: Request, exc: HTTPException) -> JSONResponse:
+        code = {
+            401: "AUTHENTICATION_REQUIRED",
+            403: "AUTHORIZATION_FAILED",
+            503: "AUTHENTICATION_UNAVAILABLE",
+        }.get(exc.status_code, "HTTP_ERROR")
+        payload = ErrorEnvelope(
+            error=ErrorDetail(
+                code=code,
+                message=str(exc.detail),
+                request_id=getattr(request.state, "request_id", None),
+            )
+        )
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=payload.model_dump(mode="json"),
+            headers=exc.headers,
         )
 
     return application

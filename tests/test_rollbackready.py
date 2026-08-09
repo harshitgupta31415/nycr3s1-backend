@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from app.core.clerk_auth import get_clerk_user_id
 from app.main import create_app
+from app.rollbackready.artifacts import InMemoryArtifactStore
 from app.rollbackready.contracts import (
     AnalysisStatus,
     EvidenceLevel,
@@ -23,7 +24,11 @@ from app.rollbackready.contracts import (
     Verdict,
 )
 from app.rollbackready.errors import RollbackReadyError
-from app.rollbackready.intake import load_demo_bundle, load_project_bundle
+from app.rollbackready.intake import (
+    build_demo_archive,
+    load_demo_bundle,
+    load_project_bundle,
+)
 from app.rollbackready.persistence import NullEvidenceRepository
 from app.rollbackready.risk import analyze_risks
 from app.rollbackready.sandbox import PostgresSandbox
@@ -33,6 +38,7 @@ from app.rollbackready.sql import redact_sql, split_sql, validate_sql_policy
 
 OWNER_A = "user_owner_a"
 OWNER_B = "user_owner_b"
+IDEMPOTENCY_HEADERS = {"Idempotency-Key": "test-key-0001"}
 
 
 class _FakeSimulator:
@@ -236,6 +242,48 @@ def test_server_level_sql_is_rejected(sql: str) -> None:
         validate_sql_policy(sql)
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "CREATE/**/ROLE attacker SUPERUSER",
+        'SELECT pg_catalog."pg_sleep"(1)',
+        'SELECT "pg_read_file"(\'/etc/passwd\')',
+        "DO $$ BEGIN PERFORM 1; END $$",
+        "CREATE FUNCTION exploit() RETURNS void LANGUAGE plpgsql AS $$ BEGIN END $$",
+        "BEGIN",
+        "PREPARE TRANSACTION 'escape'",
+        "COPY users FROM PROGRAM 'curl example.com'",
+    ],
+)
+def test_obfuscated_and_transaction_abuse_is_rejected(sql: str) -> None:
+    with pytest.raises(RollbackReadyError) as error:
+        validate_sql_policy(sql)
+
+    assert error.value.code == "UNSUPPORTED_SQL"
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        'CREATE TABLE "User" ("id" TEXT PRIMARY KEY)',
+        'ALTER TABLE "User" ADD COLUMN "email" TEXT',
+        'CREATE UNIQUE INDEX "User_email_key" ON "User"("email")',
+        'DROP INDEX "User_email_key"',
+        'CREATE TYPE "Mood" AS ENUM (\'HAPPY\', \'SAD\')',
+        'COMMENT ON TABLE "User" IS \'managed by prisma\'',
+    ],
+)
+def test_supported_prisma_migration_shapes_pass_policy(sql: str) -> None:
+    assert validate_sql_policy(sql)
+
+
+def test_malformed_or_nul_sql_fails_closed() -> None:
+    for sql in ("SELECT (", "SELECT \x00"):
+        with pytest.raises(RollbackReadyError) as error:
+            validate_sql_policy(sql)
+        assert error.value.code == "INVALID_SQL"
+
+
 def test_zip_traversal_is_rejected() -> None:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
@@ -272,12 +320,74 @@ def test_demo_endpoint_stages_without_accepting_a_production_url() -> None:
         response = client.post(
             "/api/v1/analyses",
             data={"use_demo": "true", "database_url": "postgresql://production"},
+            headers=IDEMPOTENCY_HEADERS,
         )
 
     assert response.status_code == 201
     body = response.json()
     assert body["provider"] == "postgresql"
     assert "database_url" not in body
+
+
+def test_create_idempotency_replays_without_duplicate_analysis() -> None:
+    application = create_app(dict)
+    application.dependency_overrides[get_clerk_user_id] = lambda: OWNER_A
+    with TestClient(application) as client:
+        first = client.post(
+            "/api/v1/analyses",
+            data={"use_demo": "true"},
+            headers={"Idempotency-Key": "same-create-key"},
+        )
+        replay = client.post(
+            "/api/v1/analyses",
+            data={"use_demo": "true"},
+            headers={"Idempotency-Key": "same-create-key"},
+        )
+
+    assert first.status_code == status.HTTP_201_CREATED
+    assert replay.status_code == status.HTTP_201_CREATED
+    assert replay.json()["id"] == first.json()["id"]
+    assert first.headers["idempotency-replayed"] == "false"
+    assert replay.headers["idempotency-replayed"] == "true"
+
+
+def test_invalid_create_releases_idempotency_key_for_retry() -> None:
+    application = create_app(dict)
+    application.dependency_overrides[get_clerk_user_id] = lambda: OWNER_A
+    headers = {"Idempotency-Key": "retry-after-invalid"}
+    with TestClient(application) as client:
+        invalid = client.post("/api/v1/analyses", headers=headers)
+        retried = client.post(
+            "/api/v1/analyses",
+            data={"use_demo": "true"},
+            headers=headers,
+        )
+
+    assert invalid.status_code == status.HTTP_400_BAD_REQUEST
+    assert retried.status_code == status.HTTP_201_CREATED
+
+
+def test_raw_artifact_is_deleted_after_plan_verification() -> None:
+    artifact_store = InMemoryArtifactStore()
+    service = AnalysisService(
+        simulator=_FakeSimulator(),
+        planner=_FakePlanner(),
+        repository=NullEvidenceRepository(),
+        artifact_store=artifact_store,
+    )
+    archive = build_demo_archive()
+    staged = service.create(load_demo_bundle(), OWNER_A, archive)
+    object_name = f"analyses/{staged.id}/bundle.zip"
+
+    assert staged.raw_artifacts_available
+    service.run(staged.id, OWNER_A)
+    plan = service.create_plan(staged.id, OWNER_A)
+    service.verify_plan(staged.id, plan.id, OWNER_A)
+
+    assert not service.get(staged.id, OWNER_A).raw_artifacts_available
+    with pytest.raises(RollbackReadyError) as error:
+        artifact_store.get(object_name, "1")
+    assert error.value.code == "RAW_ARTIFACTS_DELETED"
 
 
 def test_verified_recovery_plan_does_not_replace_unsafe_candidate_verdict() -> None:
@@ -403,7 +513,9 @@ def test_product_routes_require_authentication_while_system_routes_stay_public()
     application.dependency_overrides[get_clerk_user_id] = reject_unsigned_request
     with TestClient(application) as client:
         product_response = client.post(
-            "/api/v1/analyses", data={"use_demo": "true"}
+            "/api/v1/analyses",
+            data={"use_demo": "true"},
+            headers=IDEMPOTENCY_HEADERS,
         )
         root_response = client.get("/")
         health_response = client.get("/health")
@@ -415,12 +527,38 @@ def test_product_routes_require_authentication_while_system_routes_stay_public()
     assert docs_response.status_code == status.HTTP_200_OK
 
 
+def test_error_envelope_and_response_echo_valid_request_id() -> None:
+    application = create_app(dict)
+
+    def reject_unsigned_request() -> str:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+        )
+
+    application.dependency_overrides[get_clerk_user_id] = reject_unsigned_request
+    with TestClient(application) as client:
+        response = client.post(
+            "/api/v1/analyses",
+            data={"use_demo": "true"},
+            headers={
+                "Idempotency-Key": "request-id-auth",
+                "X-Request-ID": "request_12345678",
+            },
+        )
+
+    assert response.headers["x-request-id"] == "request_12345678"
+    assert response.json()["error"]["request_id"] == "request_12345678"
+
+
 def test_api_returns_not_found_for_another_authenticated_owner() -> None:
     application = create_app(dict)
     application.dependency_overrides[get_clerk_user_id] = lambda: OWNER_A
     with TestClient(application) as client:
         created = client.post(
-            "/api/v1/analyses", data={"use_demo": "true"}
+            "/api/v1/analyses",
+            data={"use_demo": "true"},
+            headers=IDEMPOTENCY_HEADERS,
         )
         analysis_id = created.json()["id"]
         application.dependency_overrides[get_clerk_user_id] = lambda: OWNER_B
@@ -435,10 +573,16 @@ def test_analysis_create_rate_limit_returns_retry_header() -> None:
     application = create_app(dict)
     application.dependency_overrides[get_clerk_user_id] = lambda: OWNER_A
     with TestClient(application) as client:
-        responses = [
-            client.post("/api/v1/analyses", data={"use_demo": "true"})
-            for _ in range(11)
-        ]
+        responses = []
+        for index in range(11):
+            response = client.post(
+                "/api/v1/analyses",
+                data={"use_demo": "true"},
+                headers={"Idempotency-Key": f"rate-key-{index:04d}"},
+            )
+            responses.append(response)
+            if response.status_code == status.HTTP_201_CREATED:
+                client.delete(f"/api/v1/analyses/{response.json()['id']}")
 
     assert all(response.status_code == 201 for response in responses[:10])
     assert responses[-1].status_code == status.HTTP_429_TOO_MANY_REQUESTS

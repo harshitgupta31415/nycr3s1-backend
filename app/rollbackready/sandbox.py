@@ -220,7 +220,19 @@ class PostgresSandbox:
         deadline = min(time.monotonic() + 45, self._deadline)
         while time.monotonic() < deadline:
             result = subprocess.run(
-                ["docker", "exec", self._container, "pg_isready", "-U", ADMIN_USER],
+                [
+                    "docker",
+                    "exec",
+                    self._container,
+                    "psql",
+                    "--no-psqlrc",
+                    "--username",
+                    ADMIN_USER,
+                    "--dbname",
+                    "postgres",
+                    "--command",
+                    "SELECT 1",
+                ],
                 capture_output=True,
                 text=True,
                 timeout=self._remaining_timeout(5),

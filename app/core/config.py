@@ -25,8 +25,8 @@ class Settings:
     cors_origins: tuple[str, ...]
     clerk_secret_key: str | None = None
     clerk_jwt_key: str | None = None
+    clerk_issuer: str | None = None
     clerk_authorized_parties: tuple[str, ...] = ()
-    clerk_auth_required: bool = False
     google_cloud_project: str | None = None
     google_cloud_location: str = "global"
     google_genai_use_vertexai: bool = True
@@ -40,7 +40,13 @@ class Settings:
     rollbackready_max_total_rows: int = 10_000
     rollbackready_max_active_analyses: int = 25
     rollbackready_create_rate_limit_per_minute: int = 10
+    rollbackready_plan_rate_limit_per_hour: int = 3
+    rollbackready_verify_rate_limit_per_hour: int = 5
+    rollbackready_max_plans_per_analysis: int = 3
+    rollbackready_max_unfinished_per_user: int = 5
     rollbackready_persist_reports: bool = False
+    rollbackready_artifact_bucket: str | None = None
+    rollbackready_artifact_retention_hours: int = 24
 
     @classmethod
     def from_environment(cls) -> Settings:
@@ -63,11 +69,8 @@ class Settings:
             cors_origins=origins,
             clerk_secret_key=os.getenv("CLERK_SECRET_KEY"),
             clerk_jwt_key=os.getenv("CLERK_JWT_KEY"),
+            clerk_issuer=os.getenv("CLERK_ISSUER"),
             clerk_authorized_parties=authorized_parties,
-            clerk_auth_required=os.getenv("CLERK_AUTH_REQUIRED", "false")
-            .strip()
-            .lower()
-            in {"1", "true", "yes", "on"},
             google_cloud_project=os.getenv("GOOGLE_CLOUD_PROJECT"),
             google_cloud_location=os.getenv("GOOGLE_CLOUD_LOCATION", "global"),
             google_genai_use_vertexai=use_vertex_ai in {"1", "true", "yes", "on"},
@@ -97,10 +100,26 @@ class Settings:
             rollbackready_create_rate_limit_per_minute=int(
                 os.getenv("ROLLBACKREADY_CREATE_RATE_LIMIT_PER_MINUTE", "10")
             ),
+            rollbackready_plan_rate_limit_per_hour=int(
+                os.getenv("ROLLBACKREADY_PLAN_RATE_LIMIT_PER_HOUR", "3")
+            ),
+            rollbackready_verify_rate_limit_per_hour=int(
+                os.getenv("ROLLBACKREADY_VERIFY_RATE_LIMIT_PER_HOUR", "5")
+            ),
+            rollbackready_max_plans_per_analysis=int(
+                os.getenv("ROLLBACKREADY_MAX_PLANS_PER_ANALYSIS", "3")
+            ),
+            rollbackready_max_unfinished_per_user=int(
+                os.getenv("ROLLBACKREADY_MAX_UNFINISHED_PER_USER", "5")
+            ),
             rollbackready_persist_reports=os.getenv(
                 "ROLLBACKREADY_PERSIST_REPORTS", "false"
             ).strip().lower()
             in {"1", "true", "yes", "on"},
+            rollbackready_artifact_bucket=os.getenv("ROLLBACKREADY_ARTIFACT_BUCKET"),
+            rollbackready_artifact_retention_hours=int(
+                os.getenv("ROLLBACKREADY_ARTIFACT_RETENTION_HOURS", "24")
+            ),
         )
 
     @property

@@ -53,8 +53,6 @@ spec:
               value: "25"
             - name: ROLLBACKREADY_CREATE_RATE_LIMIT_PER_MINUTE
               value: "10"
-            - name: CLERK_AUTH_REQUIRED
-              value: "false"
           ports:
             - name: http
               containerPort: 8080

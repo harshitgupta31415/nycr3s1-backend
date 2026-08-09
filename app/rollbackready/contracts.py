@@ -251,6 +251,7 @@ class AnalysisSummary(BaseModel):
     created_at: datetime
     updated_at: datetime
     expires_at: datetime
+    raw_artifacts_available: bool = False
     manifest: ArtifactManifest
     findings: list[RiskFinding] = Field(default_factory=list)
     evidence: list[EvidenceDimension] = Field(default_factory=list)
@@ -274,6 +275,7 @@ class ErrorDetail(BaseModel):
     code: str
     message: str
     analysis_id: str | None = None
+    request_id: str | None = None
     details: dict[str, Any] = Field(default_factory=dict)
 
 

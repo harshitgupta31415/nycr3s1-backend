@@ -21,5 +21,8 @@ def test_rollbackready_analysis_model_stores_sanitized_metadata() -> None:
     assert analyses.c.owner_clerk_user_id.index is True
     assert "manifest" in analyses.c
     assert "evidence" in analyses.c
+    assert "artifact_object_name" in analyses.c
+    assert "active_operation_token" in analyses.c
+    assert "row_version" in analyses.c
     assert "raw_archive" not in analyses.c
     assert "seed_sql" not in analyses.c

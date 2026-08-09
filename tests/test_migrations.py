@@ -55,8 +55,9 @@ def test_rollbackready_revision_is_the_alembic_head() -> None:
     evidence_revision = scripts.get_revision("0003_rollbackready_evidence")
     ownership_revision = scripts.get_revision("0004_add_analysis_ownership")
     statement_revision = scripts.get_revision("0005_add_statement_evidence")
+    hardening_revision = scripts.get_revision("0006_prod_hardening")
 
-    assert scripts.get_current_head() == "0005_add_statement_evidence"
+    assert scripts.get_current_head() == "0006_prod_hardening"
     assert all(len(item.revision) <= 32 for item in scripts.walk_revisions())
     assert revision is not None
     assert revision.down_revision == "0001_create_app_schema"
@@ -66,6 +67,8 @@ def test_rollbackready_revision_is_the_alembic_head() -> None:
     assert ownership_revision.down_revision == "0003_rollbackready_evidence"
     assert statement_revision is not None
     assert statement_revision.down_revision == "0004_add_analysis_ownership"
+    assert hardening_revision is not None
+    assert hardening_revision.down_revision == "0005_add_statement_evidence"
 
 
 def test_users_revision_upgrade_and_downgrade_structure(monkeypatch) -> None:

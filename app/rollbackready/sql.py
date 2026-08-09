@@ -4,37 +4,124 @@ import hashlib
 import re
 from dataclasses import dataclass
 
+try:
+    from pg_query import parse as pg_parse
+    from pg_query import walk as pg_walk
+except ImportError:  # Windows has no supported pg-query-python wheel.
+    pg_parse = None
+    pg_walk = None
+
+import sqlglot
+
 from app.rollbackready.errors import RollbackReadyError
 
 MAX_CANDIDATE_STATEMENTS = 25
 MAX_LEGACY_QUERIES = 20
 
-_BLOCKED_PATTERNS: tuple[tuple[str, str], ...] = (
-    (r"\b(?:CREATE|DROP|ALTER)\s+(?:DATABASE|ROLE|USER|TABLESPACE)\b", "server_administration"),
-    (r"\b(?:GRANT|REVOKE)\b", "privilege_administration"),
-    (r"\bCOPY\b[\s\S]*?\bPROGRAM\b", "filesystem_execution"),
-    (r"\b(?:CREATE|ALTER)\s+(?:EVENT\s+TRIGGER|EXTENSION)\b", "server_extension"),
-    (r"\bCREATE\s+(?:SERVER|FOREIGN\s+DATA\s+WRAPPER|LANGUAGE)\b", "external_access"),
-    (r"\b(?:CREATE|ALTER)\s+(?:PUBLICATION|SUBSCRIPTION)\b", "replication"),
-    (r"\b(?:ALTER\s+SYSTEM|LOAD\s+|SET\s+(?:ROLE|SESSION\s+AUTHORIZATION))\b", "server_configuration"),
-    (r"\b(?:pg_read_file|pg_write_file|pg_ls_dir|lo_import|lo_export|dblink|postgres_fdw)\s*\(", "external_access"),
-    (r"\bpg_sleep\s*\(", "resource_exhaustion"),
-    (r"\bDO\s+\$|\bCREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\b", "procedural_code"),
-)
+_LEGACY_ROOTS = {"SelectStmt", "InsertStmt", "UpdateStmt", "DeleteStmt"}
+_MIGRATION_ROOTS = _LEGACY_ROOTS | {
+    "AlterEnumStmt",
+    "AlterTableStmt",
+    "CommentStmt",
+    "CreateEnumStmt",
+    "CreateSchemaStmt",
+    "CreateStmt",
+    "DropStmt",
+    "IndexStmt",
+    "RenameStmt",
+    "TruncateStmt",
+    "ViewStmt",
+}
 
-_LEGACY_ALLOWED = {"SELECT", "INSERT", "UPDATE", "DELETE"}
-_MIGRATION_ALLOWED = {
-    "ALTER",
-    "CREATE",
-    "DROP",
-    "TRUNCATE",
-    "INSERT",
-    "UPDATE",
-    "DELETE",
-    "SELECT",
-    "COMMENT",
-    "BEGIN",
-    "COMMIT",
+_BLOCKED_NODE_CATEGORIES = {
+    "AlterDatabaseSetStmt": "server_administration",
+    "AlterDatabaseStmt": "server_administration",
+    "AlterDefaultPrivilegesStmt": "privilege_administration",
+    "AlterEventTrigStmt": "server_extension",
+    "AlterExtensionContentsStmt": "server_extension",
+    "AlterExtensionStmt": "server_extension",
+    "AlterForeignServerStmt": "external_access",
+    "AlterObjectDependsStmt": "server_administration",
+    "AlterOwnerStmt": "privilege_administration",
+    "AlterPublicationStmt": "replication",
+    "AlterRoleSetStmt": "privilege_administration",
+    "AlterRoleStmt": "privilege_administration",
+    "AlterSubscriptionStmt": "replication",
+    "AlterSystemStmt": "server_configuration",
+    "CallStmt": "procedural_code",
+    "CompositeTypeStmt": "procedural_code",
+    "CopyStmt": "filesystem_execution",
+    "CreateAmStmt": "server_extension",
+    "CreateCastStmt": "server_extension",
+    "CreateConversionStmt": "server_extension",
+    "CreateDomainStmt": "procedural_code",
+    "CreateEventTrigStmt": "server_extension",
+    "CreateExtensionStmt": "server_extension",
+    "CreateFdwStmt": "external_access",
+    "CreateForeignServerStmt": "external_access",
+    "CreateForeignTableStmt": "external_access",
+    "CreateFunctionStmt": "procedural_code",
+    "CreatePLangStmt": "procedural_code",
+    "CreatePolicyStmt": "privilege_administration",
+    "CreatePublicationStmt": "replication",
+    "CreateRoleStmt": "privilege_administration",
+    "CreateSubscriptionStmt": "replication",
+    "CreatedbStmt": "server_administration",
+    "DoStmt": "procedural_code",
+    "DropRoleStmt": "privilege_administration",
+    "DropSubscriptionStmt": "replication",
+    "DropdbStmt": "server_administration",
+    "GrantRoleStmt": "privilege_administration",
+    "GrantStmt": "privilege_administration",
+    "ImportForeignSchemaStmt": "external_access",
+    "LoadStmt": "filesystem_execution",
+    "SecLabelStmt": "server_administration",
+    "TransactionStmt": "transaction_control",
+    "VariableSetStmt": "server_configuration",
+}
+
+_BLOCKED_FUNCTIONS = {
+    "dblink",
+    "lo_export",
+    "lo_import",
+    "pg_backup_start",
+    "pg_backup_stop",
+    "pg_cancel_backend",
+    "pg_create_restore_point",
+    "pg_file_rename",
+    "pg_file_sync",
+    "pg_file_unlink",
+    "pg_log_backend_memory_contexts",
+    "pg_ls_dir",
+    "pg_promote",
+    "pg_read_binary_file",
+    "pg_read_file",
+    "pg_reload_conf",
+    "pg_rotate_logfile",
+    "pg_sleep",
+    "pg_stat_file",
+    "pg_switch_wal",
+    "pg_terminate_backend",
+    "pg_write_file",
+    "set_config",
+}
+
+_ROOT_KINDS = {
+    "AlterEnumStmt": "ALTER",
+    "AlterTableStmt": "ALTER",
+    "CommentStmt": "COMMENT",
+    "CreateEnumStmt": "CREATE",
+    "CreateSchemaStmt": "CREATE",
+    "CreateStmt": "CREATE",
+    "DeleteStmt": "DELETE",
+    "DropStmt": "DROP",
+    "IndexStmt": "CREATE",
+    "InsertStmt": "INSERT",
+    "RenameStmt": "ALTER",
+    "SelectStmt": "SELECT",
+    "TruncateStmt": "TRUNCATE",
+    "UpdateStmt": "UPDATE",
+    "ViewStmt": "CREATE",
 }
 
 
@@ -170,6 +257,12 @@ def validate_sql_policy(
     legacy_query: bool = False,
     analysis_id: str | None = None,
 ) -> list[PolicyStatement]:
+    if "\x00" in script:
+        raise RollbackReadyError(
+            "INVALID_SQL",
+            "The SQL could not be parsed by the PostgreSQL 18 policy engine.",
+            analysis_id=analysis_id,
+        )
     statements = split_sql(script)
     maximum = 1 if legacy_query else MAX_CANDIDATE_STATEMENTS
     if not statements:
@@ -186,35 +279,168 @@ def validate_sql_policy(
             details={"statement_count": len(statements), "limit": maximum},
         )
 
-    allowed = _LEGACY_ALLOWED if legacy_query else _MIGRATION_ALLOWED
+    allowed_roots = _LEGACY_ROOTS if legacy_query else _MIGRATION_ROOTS
     validated: list[PolicyStatement] = []
     for index, statement in enumerate(statements, start=1):
         shape = redact_sql(statement)
-        for pattern, category in _BLOCKED_PATTERNS:
-            if re.search(pattern, statement, flags=re.IGNORECASE):
-                raise RollbackReadyError(
-                    "UNSUPPORTED_SQL",
-                    "The SQL contains a server-level or unsafe operation that cannot run in verified mode.",
-                    analysis_id=analysis_id,
-                    details={"statement_index": index, "category": category},
-                )
-        kind = statement_kind(statement)
-        if kind not in allowed:
+        root_name, nodes = _parse_statement_ast(
+            statement,
+            statement_index=index,
+            analysis_id=analysis_id,
+        )
+        if root_name not in allowed_roots:
             raise RollbackReadyError(
                 "UNSUPPORTED_SQL",
-                f"{kind.title()} statements are not supported in this analysis mode.",
+                "The SQL statement type is not supported in this analysis mode.",
                 analysis_id=analysis_id,
-                details={"statement_index": index, "category": "unsupported_statement"},
+                details={
+                    "statement_index": index,
+                    "category": "unsupported_statement",
+                    "node_type": root_name,
+                },
             )
-        if legacy_query and kind in {"BEGIN", "COMMIT"}:
-            raise RollbackReadyError(
-                "UNSUPPORTED_SQL",
-                "Legacy queries cannot contain transaction-control statements.",
-                analysis_id=analysis_id,
-                details={"statement_index": index, "category": "transaction_control"},
-            )
+        _validate_ast_nodes(
+            nodes,
+            statement_index=index,
+            analysis_id=analysis_id,
+        )
+        kind = _ROOT_KINDS[root_name]
         validated.append(PolicyStatement(index, statement, shape, kind))
     return validated
+
+
+def _parse_statement_ast(
+    statement: str,
+    *,
+    statement_index: int,
+    analysis_id: str | None,
+) -> tuple[str, list[object]]:
+    try:
+        if pg_parse is None or pg_walk is None:
+            return _parse_with_development_fallback(
+                statement,
+                statement_index=statement_index,
+                analysis_id=analysis_id,
+            )
+        tree = pg_parse(statement)
+        if len(tree.stmts) != 1:
+            raise ValueError("expected one parsed statement")
+        nodes = [node for _, node in pg_walk(tree)]
+        raw_statement = tree.stmts[0]
+        root = next(
+            node for field, node in pg_walk(raw_statement) if field == "stmt"
+        )
+    except RollbackReadyError:
+        raise
+    except Exception as exc:
+        raise RollbackReadyError(
+            "INVALID_SQL",
+            "The SQL could not be parsed by the PostgreSQL 18 policy engine.",
+            analysis_id=analysis_id,
+            details={"statement_index": statement_index},
+        ) from exc
+    return type(root).__name__, nodes
+
+
+def _parse_with_development_fallback(
+    statement: str,
+    *,
+    statement_index: int,
+    analysis_id: str | None,
+) -> tuple[str, list[object]]:
+    """Conservative Windows fallback; production images use libpg_query."""
+    normalized = re.sub(r"/\*.*?\*/", " ", statement, flags=re.DOTALL)
+    normalized = re.sub(r"--[^\r\n]*", " ", normalized)
+    normalized = re.sub(
+        r'"((?:[^"]|"")*)"',
+        lambda match: match.group(1).replace('""', '"'),
+        normalized,
+    )
+    normalized = re.sub(r"\s+", " ", normalized).upper()
+    blocked = re.search(
+        r"\b(?:CREATE|ALTER|DROP)\s+(?:DATABASE|ROLE|USER|EXTENSION|FUNCTION|LANGUAGE|SERVER|PUBLICATION|SUBSCRIPTION)\b"
+        r"|\b(?:GRANT|REVOKE|COPY|CALL|DO|LOAD|BEGIN|COMMIT|ROLLBACK|SAVEPOINT|PREPARE|ALTER\s+SYSTEM)\b"
+        r"|\b(?:PG_SLEEP|PG_READ_FILE|PG_READ_BINARY_FILE|PG_WRITE_FILE|PG_LS_DIR|PG_STAT_FILE|LO_IMPORT|LO_EXPORT|DBLINK|SET_CONFIG)\s*\(",
+        normalized,
+    )
+    if blocked:
+        _unsafe_node(
+            statement_index,
+            "unsafe_operation",
+            "DevelopmentFallbackPolicy",
+            analysis_id,
+        )
+    expression = sqlglot.parse_one(statement, read="postgres")
+    root = {
+        "alter": "AlterTableStmt",
+        "comment": "CommentStmt",
+        "create": "CreateStmt",
+        "delete": "DeleteStmt",
+        "drop": "DropStmt",
+        "insert": "InsertStmt",
+        "select": "SelectStmt",
+        "truncate": "TruncateStmt",
+        "update": "UpdateStmt",
+    }.get(expression.key, type(expression).__name__)
+    return root, []
+
+
+def _validate_ast_nodes(
+    nodes: list[object],
+    *,
+    statement_index: int,
+    analysis_id: str | None,
+) -> None:
+    for node in nodes:
+        node_name = type(node).__name__
+        category = _BLOCKED_NODE_CATEGORIES.get(node_name)
+        if category:
+            _unsafe_node(statement_index, category, node_name, analysis_id)
+        if node_name == "FuncCall":
+            function_name = _function_name(node)
+            if function_name in _BLOCKED_FUNCTIONS:
+                _unsafe_node(
+                    statement_index,
+                    "external_access" if function_name != "pg_sleep" else "resource_exhaustion",
+                    node_name,
+                    analysis_id,
+                )
+        if node_name == "RangeVar":
+            schema_name = str(getattr(node, "schemaname", "")).lower()
+            if schema_name in {"information_schema", "pg_catalog", "pg_temp"}:
+                _unsafe_node(
+                    statement_index,
+                    "system_schema_access",
+                    node_name,
+                    analysis_id,
+                )
+
+
+def _function_name(node: object) -> str:
+    parts: list[str] = []
+    for part in getattr(node, "funcname", ()):
+        value = getattr(getattr(part, "string", None), "sval", "")
+        if value:
+            parts.append(str(value).lower())
+    return parts[-1] if parts else ""
+
+
+def _unsafe_node(
+    statement_index: int,
+    category: str,
+    node_name: str,
+    analysis_id: str | None,
+) -> None:
+    raise RollbackReadyError(
+        "UNSUPPORTED_SQL",
+        "The SQL contains a server-level or unsafe operation that cannot run in verified mode.",
+        analysis_id=analysis_id,
+        details={
+            "statement_index": statement_index,
+            "category": category,
+            "node_type": node_name,
+        },
+    )
 
 
 def sanitize_database_error(message: str | None) -> str | None:
