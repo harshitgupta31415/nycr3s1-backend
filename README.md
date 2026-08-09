@@ -58,14 +58,16 @@ isolated asynchronous workers and encrypted temporary artifact storage remain
 production-roadmap work.
 
 The accepted ZIP layout is documented in
-[`../../docs/rollbackready-prd.md`](../../docs/rollbackready-prd.md). Never put
+[`docs/rollbackready-prd.md`](docs/rollbackready-prd.md). Never put
 production data or a production connection string in an analysis bundle.
 
 ## Deployment
 
-Pushes to `main` run `.github/workflows/deploy.yml`, test the Python application,
-build an immutable container image, push it to Google Artifact Registry, apply
-Alembic migrations, and deploy that exact image to Cloud Run and GKE Autopilot.
+Pushes to `main` run [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml),
+test the Python application, build an immutable container image, push it to
+Google Artifact Registry, apply Alembic migrations, and deploy that exact image
+to Cloud Run and GKE Autopilot. The workflow verifies that the deployed OpenAPI
+document identifies RollbackReady `0.3.0` and exposes the analysis API.
 GitHub authenticates with short-lived Workload Identity Federation credentials;
 no service-account key is stored in GitHub.
 
@@ -79,34 +81,32 @@ PostgreSQL instance. Production does not set it and therefore always uses the
 Cloud SQL IAM variables: `INSTANCE_CONNECTION_NAME`, `IAM_DB_USER`, and
 `DB_NAME`.
 
-The source layout follows the earlier `nyc-r2-api` FastAPI project: core
-infrastructure is isolated from routers, models, schemas, and services. Alembic
-owns the schema history. Migration `0001_create_app_schema` creates the `app`
-schema; it intentionally contains zero application tables until the product idea
-and data model are selected.
+Core infrastructure is isolated from routers, database models, API contracts,
+and RollbackReady orchestration services. Alembic owns the schema history:
+`0001` creates the application schema, while later revisions add sanitized
+analysis evidence and optional Clerk ownership. Raw uploaded artifacts and
+fixture values are never persisted in these tables.
 
 The same immutable image is deployed to both Cloud Run and GKE Autopilot. GKE
 uses Workload Identity to impersonate the existing backend runtime service
 account, so neither environment stores a Google service-account key. Each push
 to `main` runs Alembic first and then rolls out both hosted backends.
 
-GKE keeps three backend Pods warm so abrupt connection bursts are distributed
-immediately. The HPA targets 50% of requested CPU, can grow to 20 Pods, and waits
-for ten minutes of lower demand before removing up to 50% of the Pods per minute.
-Autopilot adds or removes the underlying compute capacity for those Pods. The
-public Service uses a backend-service/NEG load balancer with pod-count-weighted
-routing and the reserved regional address `nycr3s1-gke-backend-ip`.
+The synchronous MVP keeps exactly one backend control Pod because raw artifacts
+remain process-local during the analysis lifecycle. The HPA is pinned to one
+replica until Phase 1 moves simulations to isolated workers with durable,
+encrypted temporary artifact storage. The public Service retains the reserved
+regional address `nycr3s1-gke-backend-ip`.
 
 ## Structure
 
 ```text
 app/
-|-- core/       # Configuration, Cloud SQL connector, SQLAlchemy base
-|-- models/     # Future SQLAlchemy models
-|-- routers/    # FastAPI routes and health probes
-|-- schemas/    # Future Pydantic request/response schemas
-|-- services/   # Future business logic
-`-- main.py     # FastAPI application assembly
+|-- core/           # Configuration, auth, Cloud SQL, SQLAlchemy base
+|-- models/         # Sanitized evidence persistence models
+|-- rollbackready/  # Contracts, rules, sandbox, simulation, planning, service
+|-- routers/        # Analysis APIs and health probes
+`-- main.py         # FastAPI application assembly and expiry lifecycle
 alembic/        # Database migration history
 k8s/            # GKE deployment, migrations, service, bootstrap, and autoscaling
 tests/          # API tests

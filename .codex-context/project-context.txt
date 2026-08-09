@@ -134,3 +134,25 @@ Verification:
 The committed branch exactly matched origin/codex/rollbackready-mvp and the worktree was clean before continued work. The initial checkpoint retained the previously verified 40 passing tests and real PostgreSQL/browser evidence. The new workflow is intentionally isolated from the production deployment workflow.
 Deployment:
 No merge, production deployment, infrastructure mutation, or production database access was performed.
+
+[2026-08-09 15:51:42 IST]
+Task:
+Finish the RollbackReady hackathon release candidate quickly, configure Clerk DNS, reconcile the final audit against current source, synchronize the PRD, and keep deployment separately gated.
+Changes:
+Added all five Clerk production CNAMEs in the authoritative Google Cloud DNS zone india-nychacks with TTL 300 and exact targets for accounts, frontend API, both DKIM selectors, and primary mail. Confirmed that every cited release blocker in the prior audit is already resolved in the current MVP source: owner-aware persistence, optional Clerk identity propagation, Alembic head, deployment smoke strings, target-schema plan verification, verification SQL, content hashing, final retry boundary, per-statement evidence, dollar-quote redaction, quotas, expiry cleanup, and mobile overflow. Updated the synchronized Markdown and DOCX PRD to describe the implemented release candidate and current operational gate; copied both deliverables into backend/docs; corrected stale README claims and its PRD link; and retained the pending OpenAPI deployment smoke check. No image or render artifact was created.
+Verification:
+Backend Ruff and all 40 tests passed on the final documentation state. Frontend lint, typecheck, and production build passed. Existing backend and frontend pull-request CI was green before this pass. Live DNS was verified against the authoritative nameserver and 1.1.1.1. Vertex AI remains enabled and the runtime identity retains roles/aiplatform.user. The Markdown and DOCX copies are byte-identical between the project docs and backend/docs. DOCX OOXML/ZIP integrity, required implementation text, and stale-text removal passed structurally; visual page-image rendering was intentionally skipped per the user's no-image instruction.
+Deployment:
+No application merge, Cloud Run/GKE deployment, production database migration, or production data access was performed. The live application services still run the earlier foundation revisions. Only the explicitly authorized DNS records changed.
+Commit:
+This entry is included in the release documentation synchronization commit. The context log remains intentionally unignored and no .gitignore file was changed.
+
+[2026-08-09 15:54:56 IST]
+Task:
+Repair stale deployment links and publish the completed RollbackReady backend to origin/main after the user explicitly authorized the direct push.
+Changes:
+Added a post-deployment OpenAPI smoke check that rejects any Cloud Run revision not identifying itself as RollbackReady API 0.3.0 with the analysis endpoint. Linked the deployment workflow from the README and included the synchronized Markdown and DOCX PRD deliverables.
+Verification:
+Fetched origin/main with no remote-only commits; the release branch was two commits ahead. Ruff passed, all 40 backend tests passed, Python compileall passed, and local Markdown targets resolved.
+Deployment:
+The direct origin/main push is explicitly authorized by the user. This release commit is intended to trigger the existing test, migration, Cloud Run, GKE, and deployment-verification workflow; live rollout success must be confirmed from GitHub Actions and the public endpoints.

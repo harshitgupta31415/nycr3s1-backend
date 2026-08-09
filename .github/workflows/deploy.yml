@@ -125,6 +125,34 @@ jobs:
             --min-instances=1
             --max-instances=1
 
+      - name: Verify deployed RollbackReady API
+        shell: bash
+        env:
+          SERVICE_URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.request
+
+          base_url = os.environ["SERVICE_URL"].rstrip("/")
+          last_error = None
+          for _ in range(12):
+              try:
+                  with urllib.request.urlopen(f"{base_url}/openapi.json", timeout=15) as response:
+                      document = json.load(response)
+                  assert document["info"]["title"] == "RollbackReady API"
+                  assert document["info"]["version"] == "0.3.0"
+                  assert "/api/v1/analyses" in document["paths"]
+                  break
+              except Exception as exc:
+                  last_error = exc
+                  time.sleep(5)
+          else:
+              raise SystemExit(f"deployed API did not become current: {last_error}")
+          PY
+
       - name: Deploy to GKE
         shell: bash
         env:
