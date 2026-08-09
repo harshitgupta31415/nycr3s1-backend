@@ -8,9 +8,10 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: backend
-  # Keep enough warm Pods to distribute connections during an abrupt burst.
-  minReplicas: 3
-  maxReplicas: 20
+  # Phase 1 moves raw artifacts to isolated workers. Until then, keep the
+  # anonymous synchronous lifecycle on one control pod.
+  minReplicas: 1
+  maxReplicas: 1
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 0

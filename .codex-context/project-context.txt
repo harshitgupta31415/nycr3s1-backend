@@ -1,0 +1,126 @@
+NYC Round 3 Session 1 — Backend Project Context
+
+Project paths:
+- Workspace: C:\Users\victus\Desktop\hackathon\nyc-r3s1
+- Frontend: C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\frontend
+- Backend: C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\backend
+- Infrastructure: C:\Users\victus\Desktop\hackathon\nyc-r3s1\infrastructure
+
+Baseline:
+- Backend stack: Python 3.13, FastAPI, Uvicorn, SQLAlchemy 2, Alembic, PostgreSQL 18, Cloud SQL Python Connector, pg8000, Pytest, Ruff, Docker.
+- GCP project: nychacksishv-core-20260808; primary region: asia-south1.
+- Live backend targets: Cloud Run service nycr3s1-backend and GKE deployment backend in namespace nyc-r3s1.
+- Database: Cloud SQL instance nycr3s1-postgres, database app, schema app; use SQLAlchemy models and Alembic migrations for schema changes.
+- Preserve the existing GCP infrastructure and local backups unless explicitly instructed otherwise.
+- Never place passwords, tokens, credentials, private keys, or other secrets in this file.
+- User instruction on 2026-08-09: do not add .codex-context/ to .gitignore. This file is intentionally unignored and must not be committed or pushed without explicit approval.
+
+[2026-08-09 12:11:37 IST]
+Task:
+Pull the current backend branch and audit the latest commit for correctness.
+Changes:
+Ran git pull --ff-only; repository was already up to date. No application source was changed. Installed the committed development requirements into the ignored local virtual environment for verification. Created this unignored local context log as explicitly requested.
+Files changed:
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\backend\.codex-context\project-context.txt
+Verification:
+Local HEAD 59e10d5964e61214d7de9501fe4cc9f2e9105826 exactly matches origin/main and GitHub refs/heads/main. The commit is not correct/merge-ready: GitHub Actions run 31299264855 failed; Ruff reproduced three errors; importing app.core.clerk_auth raises AttributeError because Settings has no CLERK_SECRET_KEY; authorized_parties and CLERK_JWT_KEY are also undefined; the User model is not registered in Base.metadata; and no users-table Alembic migration was added. pip check and compileall passed. Existing pytest suite passed 8 tests but does not exercise the new Clerk code. No fix was made because this task requested an audit, not implementation.
+Deployment:
+No deployment was initiated. The failed workflow stopped in its test-and-deploy validation stage.
+Commit:
+NOT COMMITTED — Current local HEAD: 59e10d5964e61214d7de9501fe4cc9f2e9105826
+
+[2026-08-09 13:00:59 IST]
+Task:
+Create the complete RollbackReady project PRD in synchronized Markdown and DOCX formats, assess feasibility, and remove diagram images when the user said they were not needed.
+Changes:
+Created the project-level Markdown PRD and generated the matching business-brief DOCX. The PRD defines the evidence-first six-hour MVP, full roadmap, user journey, deterministic risk rules, sandbox architecture, API and data contracts, security boundaries, Gemini limits, tests, demo script, and feasibility verdict. No diagram or other image is embedded in either deliverable.
+Files changed:
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\docs\rollbackready-prd.md
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\docs\RollbackReady-PRD.docx
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\frontend\.codex-context\project-context.txt
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\backend\.codex-context\project-context.txt
+Verification:
+Confirmed 23 synchronized PRD sections, all required product and API terms, nine primary-source URLs, 15 fixed-width tables, valid Word numbering with list restarts, page-number fields, and zero embedded media. Rendered the final DOCX through Microsoft Word to a 28-page PDF and visually inspected every page; no clipping, overlap, broken numbering, or layout defects remain. Final SHA-256: Markdown 082b89a153ccab5d46f9eebc3aea091e3513ec88e9e3b4a2b64dca49a9cb9548; DOCX 38cfae0b45a6dfd48811b272bba71c4c387ec5f406014a5cc7a0e58181515aab.
+Deployment:
+No application code, production database, cloud infrastructure, deployment, or external service was changed.
+Commit:
+NOT COMMITTED - Backend local HEAD remains 59e10d5964e61214d7de9501fe4cc9f2e9105826. The .codex-context directory remains unignored and no .gitignore file was changed.
+
+[2026-08-09 13:30:38 IST]
+Task:
+Repair only the existing backend foundation and GCP readiness, verify it locally, migrate the additive users table, and deploy the same immutable foundation image to Cloud Run and GKE without adding RollbackReady product features.
+Changes:
+Extended the existing process-environment-first Settings implementation with optional snake-case Clerk and Vertex values; repaired lazy, controlled Clerk authentication; registered the existing User model; added Alembic revision 0002_create_users; made Alembic load model metadata; pinned clerk-backend-api 6.0.1; added non-secret Clerk/Vertex examples; added focused regression tests; and stored the verified Vertex values in the GKE and CI deployment configuration. Enabled aiplatform.googleapis.com and granted only roles/aiplatform.user to the existing backend runtime service account. Preserved the user's .env.local/.env loading order, the existing user model, all database/IAM permissions, runtime resources, HPA/concurrency/storage settings, frontend changes, and .gitignore files. Concurrent app/rollbackready work appeared after the foundation image snapshot and was neither edited nor included in that image.
+Files changed:
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\backend\app\core\config.py
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\backend\app\core\clerk_auth.py
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\backend\app\models\__init__.py
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\backend\alembic\env.py
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\backend\alembic\versions\0002_create_users.py
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\backend\requirements.txt
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\backend\.env.example
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\backend\k8s\deployment.yaml
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\backend\.github\workflows\deploy.yml
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\backend\tests\test_config.py
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\backend\tests\test_clerk_auth.py
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\backend\tests\test_models.py
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\backend\tests\test_migrations.py
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\backend\.codex-context\project-context.txt
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\frontend\.codex-context\project-context.txt
+Verification:
+Dependency installation and pip check passed; compileall passed; Ruff passed; direct app/auth/model imports passed; Pytest passed 15 tests. The immutable Docker image built successfully and passed root, /health, and Docker HEALTHCHECK smokes locally. A temporary GKE pod using service account backend proved gemini-3.6-flash access and was deleted; the deployed backend pod independently repeated the Vertex call as the mapped runtime identity. Cloud Run and GKE returned HTTP 200 for /, /health, /health/ready, and /health/database, reporting one application table. Live inspection confirmed app.users columns, pk_users, uq_users_clerk_user_id, and ix_app_users_clerk_user_id. The live frontend returned HTTP 200 and was not deployed or edited.
+Deployment:
+Alembic upgrade 0001_create_app_schema -> 0002_create_users completed through job/backend-migrate. Artifact image: asia-south1-docker.pkg.dev/nychacksishv-core-20260808/nycr3s1-images/backend:foundation-20260809-130731, digest sha256:c42ff577475e4f93d4856e6c3ea13a232925cd1809533fa6417e613fa5ca8e6e. Cloud Run now serves revision nycr3s1-backend-00010-795. GKE deployment backend has 3/3 available replicas on the same image. Verified model: gemini-3.6-flash in global.
+Rollback:
+Cloud Run rollback revision: nycr3s1-backend-00009-7lp. GKE rollback image: asia-south1-docker.pkg.dev/nychacksishv-core-20260808/nycr3s1-images/backend:c22b269da411a70a74813db0d257f97f42fb5d41. The additive users-table migration should remain unless it is found defective.
+Commit:
+NOT COMMITTED OR GIT-PUSHED - No RollbackReady product route, simulation service, Gemini planner, frontend feature, API key, GitHub secret, Git commit, or Git push was created. Context logs remain intentionally unignored and .gitignore was unchanged.
+
+[2026-08-09 13:51:56 IST]
+Task:
+Implement the complete RollbackReady hackathon MVP from the approved PRD, take over all work directly, use LangChain and LangGraph for the backend recovery agent, finish quickly with focused verification, and keep all work local without committing or deploying.
+Changes:
+Implemented strict ZIP intake and artifact hashing; Prisma provider/candidate/history validation; bounded PostgreSQL-aware SQL splitting, redaction, and unsafe-statement policy; deterministic destructive, constraint, legacy-compatibility, partial-execution, retry, idempotency, recovery, and lock-heuristic findings; the built-in unsafe phone demo; a disposable PostgreSQL 18 simulator using native Unix-socket clusters in the runtime and network-isolated Docker locally; normal application, fixture, legacy-query, boundary interruption, retry, snapshot, and plan verification evidence; scoped verdict aggregation; 24-hour anonymous lifecycle and safe error envelopes; all eight /api/v1 analysis, timeline, plan, verification, report, and deletion endpoints; SQLAlchemy sanitized evidence models, Alembic revision 0003, persistence/reload support, and raw-artifact exclusion; a compiled LangGraph recovery workflow using LangChain ChatGoogleGenerativeAI structured output on Vertex AI, deterministic fallback, final SQL-policy validation, and mandatory clean-sandbox verification. Updated the backend image to package PostgreSQL 18, increased temporary resources, gated runtime concurrency to one control instance for the in-memory raw-artifact lifecycle, and documented all configuration. Preserved the prior uncommitted foundation fixes.
+Primary product files:
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\backend\app\rollbackready\
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\backend\app\routers\analyses.py
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\backend\app\models\rollbackready.py
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\backend\alembic\versions\0003_create_rollbackready_evidence.py
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\backend\tests\test_rollbackready.py
+Verification:
+Ruff passed; compileall passed; Pytest passed 28 tests; git diff --check passed. A real postgres:18-alpine sandbox rejected the unsafe phone candidate against three synthetic rows with the expected null-value error. The deterministic three-phase expand/backfill/contract plan then executed on a fresh PostgreSQL 18 sandbox, preserved row counts, and passed both legacy queries. LangGraph compiled and selected the deterministic fallback when Vertex was unavailable locally. No production connection was accepted or used.
+Deployment:
+No deployment, cloud mutation, production database migration, or external write was performed in this task. Runtime manifests and CI configuration are prepared but not applied.
+Commit:
+NOT COMMITTED OR GIT-PUSHED - Backend HEAD remains 59e10d5964e61214d7de9501fe4cc9f2e9105826. The context directory remains deliberately unignored; no .gitignore entry was added.
+
+[2026-08-09 14:16:43 IST]
+Task:
+Finish and recheck the RollbackReady hackathon MVP end to end, keeping the candidate verdict distinct from recovery-plan verification and making transient verifier failures retryable.
+Changes:
+Kept the original migration candidate verdict immutable when a safer generated plan passes verification. Added guarded plan-verification error handling that restores the candidate-derived analysis status, returns the plan to UNVERIFIED_CANDIDATE, records a sanitized PLAN_VERIFICATION_ERROR event, preserves temporary artifacts for retry, and converts unexpected failures into the standard error envelope. Added focused regression coverage for verdict separation and successful retry after SIMULATOR_BUSY. No image asset was created.
+Files changed:
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\backend\app\rollbackready\service.py
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\backend\tests\test_rollbackready.py
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\backend\.codex-context\project-context.txt
+C:\Users\victus\Desktop\hackathon\nyc-r3s1\application\frontend\.codex-context\project-context.txt
+Verification:
+Ruff passed and Pytest passed 30 tests. A fresh browser-driven run used the real disposable PostgreSQL 18 Docker sandbox: the unsafe phone migration remained UNSAFE, the deterministic LangGraph fallback plan executed from a clean baseline and became VERIFIED_FOR_REVIEW, mandatory evidence passed, both legacy queries passed, and the UI showed no error. The final page had no horizontal overflow and the browser console contained no warnings or errors. Frontend lint, typecheck, and the optimized production build also passed.
+Deployment:
+No deployment, cloud mutation, production database access, commit, push, or pull request was performed. Local smoke-test processes were stopped after verification.
+Commit:
+NOT COMMITTED OR GIT-PUSHED - Backend HEAD remains 59e10d5964e61214d7de9501fe4cc9f2e9105826. Both context logs remain intentionally unignored and no .gitignore file was changed.
+
+[2026-08-09 15:17:23 IST]
+Task:
+Resolve the final RollbackReady audit blockers and the high-priority correctness/security gaps practical within the hackathon MVP, recheck the freshly restarted project end to end, and keep the work local without committing, pushing, or deploying.
+Changes:
+Completed owner-aware report persistence and Clerk identity propagation while preserving an explicit anonymous hackathon mode; added ownership and statement-evidence Alembic revisions; corrected the migration head; made authentication optional or required by configuration; added safe rate limiting, active-analysis capacity, 24-hour background expiry cleanup, runtime and fixture-row ceilings, Docker CPU/memory/PID limits, and safer simulation error persistence/logging. Expanded schema fingerprints to cover columns, constraints, indexes, views, sequences, enums, triggers, functions, policies, and privileges; added baseline-column content hashes; added the final interruption boundary; corrected per-statement execution evidence; redacted PostgreSQL dollar-quoted values; compared generated plans with the intended candidate target; executed every generated verification assertion; and verified plan interruption recovery and idempotent retry across every boundary. The constrained LangChain/LangGraph planner remains the only agent workflow, with deterministic fallback and deterministic SQL verification. Updated the frontend for optional Clerk sessions, anonymous demo access, authorization forwarding, responsive 390px layout, current deployment smoke text, and a reliable attachment-based sanitized JSON report download. No images were created.
+Verification:
+Backend Ruff passed and all 40 tests passed. A fresh real PostgreSQL 18 Docker run kept the unsafe phone candidate UNSAFE with two confirmed high findings. The deterministic recovery plan reached VERIFIED_FOR_REVIEW only after all seven evidence dimensions passed, three verification assertions executed, four plan statements were recorded as PASS, and interruption boundaries 0 through 4 recovered. A real no-op plan failed target-schema verification. Frontend ESLint, TypeScript, and the optimized Next.js 16 production build passed. The in-app browser completed all six stages; the candidate and plan verdicts stayed separate; the report download emitted a browser download, parsed as valid JSON, contained no fixture values, and stated that production execution was false. At a 390px viewport, document width equaled client width and no overflowing elements were found.
+Deployment:
+No cloud deployment, infrastructure mutation, production database access, commit, push, or pull request was performed. The existing live infrastructure was not changed.
+Known production limitation:
+Raw verification artifacts remain process-local by design. Single-instance deployment settings reduce mid-lifecycle routing risk, but a container or pod replacement can still interrupt a staged or unverified analysis. Restart-safe asynchronous workers and encrypted temporary artifact storage remain roadmap work and the MVP must not be described as production-ready.
+Commit:
+NOT COMMITTED OR GIT-PUSHED. Both .codex-context logs remain intentionally unignored, neither log was added to .gitignore, and no .gitignore file was changed.

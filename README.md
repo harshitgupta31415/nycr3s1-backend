@@ -1,7 +1,9 @@
-# nycr3s1-backend
+# RollbackReady backend
 
-Python 3.13 and FastAPI backend foundation for NYCR3S1. It provides a stable
-hosted API and managed database connection before the product idea is selected.
+FastAPI control plane for evidence-based Prisma migration analysis. It validates
+untrusted project archives, applies deterministic risk rules, runs disposable
+PostgreSQL 18 simulations, orchestrates a constrained LangGraph recovery planner,
+and persists only sanitized reports.
 
 ## Endpoints
 
@@ -14,6 +16,14 @@ hosted API and managed database connection before the product idea is selected.
 - `GET /health/database` - verifies the hosted PostgreSQL connection
 - `GET /docs` - interactive Swagger API documentation
 - `GET /openapi.json` - generated OpenAPI schema
+- `POST /api/v1/analyses` - stage a ZIP bundle or the built-in demo
+- `POST /api/v1/analyses/{id}/run` - run deterministic analysis and simulation
+- `GET /api/v1/analyses/{id}` - retrieve the current analysis
+- `GET /api/v1/analyses/{id}/timeline` - retrieve ordered evidence events
+- `POST /api/v1/analyses/{id}/plans` - generate an unverified recovery plan
+- `POST /api/v1/analyses/{id}/plans/{plan_id}/verify` - fresh-sandbox verification
+- `GET /api/v1/analyses/{id}/report` - retrieve the sanitized report
+- `DELETE /api/v1/analyses/{id}` - remove report metadata
 
 ## Local development
 
@@ -28,6 +38,28 @@ python -m app
 ```
 
 The service listens on `PORT` or `8080` by default.
+
+The default hackathon access mode is anonymous and uses possession of the
+opaque analysis UUID as its boundary. When Clerk credentials are configured,
+requests are associated with the authenticated Clerk subject and reports are
+owner-isolated. Set `CLERK_AUTH_REQUIRED=true` only after the frontend session
+integration is configured; otherwise the built-in demo remains available under
+the reserved anonymous owner.
+
+Set `ROLLBACKREADY_SANDBOX_BACKEND=docker` on Windows or macOS to use the
+network-isolated `postgres:18-alpine` development sandbox. The deployed image
+contains native PostgreSQL 18 binaries and listens only on a Unix socket.
+
+Raw project bundles intentionally remain process-local and are deleted after
+the analysis/verification lifecycle. A container or pod replacement can
+therefore interrupt a staged or unverified analysis. The single-instance MVP
+settings reduce routing risk but do not make the lifecycle restart-safe;
+isolated asynchronous workers and encrypted temporary artifact storage remain
+production-roadmap work.
+
+The accepted ZIP layout is documented in
+[`../../docs/rollbackready-prd.md`](../../docs/rollbackready-prd.md). Never put
+production data or a production connection string in an analysis bundle.
 
 ## Deployment
 

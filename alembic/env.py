@@ -1,7 +1,7 @@
 from logging.config import fileConfig
 
+import app.models  # noqa: F401
 from alembic import context
-
 from app.core.database import Base, get_database_engine
 
 config = context.config

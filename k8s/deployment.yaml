@@ -7,7 +7,9 @@ metadata:
     app.kubernetes.io/name: backend
     app.kubernetes.io/part-of: nycr3s1
 spec:
-  replicas: 3
+  # Raw artifacts exist only in this process until the synchronous run/plan
+  # lifecycle ends, so the anonymous MVP deliberately uses one control pod.
+  replicas: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: backend
@@ -29,6 +31,30 @@ spec:
               value: nycr3s1-backend-runtime@nychacksishv-core-20260808.iam
             - name: DB_NAME
               value: app
+            - name: GOOGLE_CLOUD_PROJECT
+              value: nychacksishv-core-20260808
+            - name: GOOGLE_CLOUD_LOCATION
+              value: global
+            - name: GOOGLE_GENAI_USE_VERTEXAI
+              value: "true"
+            - name: GEMINI_MODEL
+              value: gemini-3.6-flash
+            - name: ROLLBACKREADY_SANDBOX_BACKEND
+              value: native
+            - name: ROLLBACKREADY_POSTGRES_BIN
+              value: /usr/lib/postgresql/18/bin
+            - name: ROLLBACKREADY_PERSIST_REPORTS
+              value: "true"
+            - name: ROLLBACKREADY_TOTAL_RUNTIME_SECONDS
+              value: "90"
+            - name: ROLLBACKREADY_MAX_TOTAL_ROWS
+              value: "10000"
+            - name: ROLLBACKREADY_MAX_ACTIVE_ANALYSES
+              value: "25"
+            - name: ROLLBACKREADY_CREATE_RATE_LIMIT_PER_MINUTE
+              value: "10"
+            - name: CLERK_AUTH_REQUIRED
+              value: "false"
           ports:
             - name: http
               containerPort: 8080
@@ -51,12 +77,12 @@ spec:
           resources:
             requests:
               cpu: 250m
-              memory: 256Mi
-              ephemeral-storage: 256Mi
+              memory: 768Mi
+              ephemeral-storage: 1Gi
             limits:
               cpu: "1"
-              memory: 512Mi
-              ephemeral-storage: 512Mi
+              memory: 1536Mi
+              ephemeral-storage: 1536Mi
           volumeMounts:
             - name: temporary-files
               mountPath: /tmp
@@ -68,7 +94,7 @@ spec:
       volumes:
         - name: temporary-files
           emptyDir:
-            sizeLimit: 64Mi
+            sizeLimit: 1Gi
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001

@@ -17,7 +17,7 @@ def create_health_router(database_check: DatabaseCheck) -> APIRouter:
     @router.get("/health")
     async def service_health() -> dict[str, str]:
         """Liveness check; deliberately does not depend on the database."""
-        return {"status": "healthy", "service": "nycr3s1-backend"}
+        return {"status": "healthy", "service": "rollbackready-backend"}
 
     def database_status():
         try:

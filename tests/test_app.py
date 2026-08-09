@@ -21,10 +21,10 @@ def test_root_identifies_fastapi_service() -> None:
 
     assert response.status_code == 200
     assert response.json() == {
-        "service": "nycr3s1-backend",
+        "service": "rollbackready-backend",
         "status": "ready",
         "runtime": "python-fastapi",
-        "message": "FastAPI backend and managed PostgreSQL foundation are ready.",
+        "message": "RollbackReady analysis API is ready.",
     }
 
 
@@ -35,7 +35,7 @@ def test_service_health() -> None:
     assert response.status_code == 200
     assert response.json() == {
         "status": "healthy",
-        "service": "nycr3s1-backend",
+        "service": "rollbackready-backend",
     }
 
 
@@ -81,4 +81,6 @@ def test_openapi_document_is_available() -> None:
         response = client.get("/openapi.json")
 
     assert response.status_code == 200
-    assert response.json()["info"]["title"] == "NYCR3S1 Backend"
+    document = response.json()
+    assert document["info"]["title"] == "RollbackReady API"
+    assert "/api/v1/analyses" in document["paths"]
