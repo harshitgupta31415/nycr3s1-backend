@@ -10,17 +10,23 @@ permissions:
   id-token: write
 
 concurrency:
-  group: backend-production
+  group: backend-production-gke
   cancel-in-progress: true
 
 env:
   PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
   REGION: ${{ vars.GCP_REGION }}
   ARTIFACT_REPOSITORY: ${{ vars.GCP_ARTIFACT_REPOSITORY }}
-  CLOUD_RUN_SERVICE: ${{ vars.GCP_CLOUD_RUN_SERVICE }}
+  ARTIFACT_BUCKET: ${{ vars.GCP_ARTIFACT_BUCKET }}
   RUNTIME_SERVICE_ACCOUNT: ${{ vars.GCP_RUNTIME_SERVICE_ACCOUNT }}
   GKE_CLUSTER: ${{ vars.GCP_GKE_CLUSTER }}
   GKE_NAMESPACE: nyc-r3s1
+  CORS_ORIGIN: https://dbsentinal.get200.qd.je
+  CLERK_AUTHORIZED_PARTIES: https://dbsentinal.get200.qd.je
+  CLERK_ISSUER: https://clerk.dbsentinal.get200.qd.je
+  CLERK_JWKS_URL: https://clerk.dbsentinal.get200.qd.je/.well-known/jwks.json
+  ROLLBACKREADY_PRIVILEGED_CLERK_USER_IDS: ${{ vars.ROLLBACKREADY_PRIVILEGED_CLERK_USER_IDS }}
+  CLERK_JWT_KEY: "-----BEGIN PUBLIC KEY-----\\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAx7rzLr5CUc7gwuej16gO9JkM8Q4WN2hoB99Dep5MKQ1ODV9i0APwwlDowE5mkP38282HItL9P+75mNBUbN9r6LqPjOZAoQAUJ+ZOaAeSo+fFO5bH6pf8TInCr120Aoe5eWKF3Ns2bvMtromEBJx+bzgptzojIhOvRTTXkENozYEnuV7GW+EDDnBD4Em3d0xheL0pHqloPTO3eq34nfX30SyNza9jEwEzK2cO0FOl//cln+JzpMBcZyn/NGfzwDMk8wauX+d/m0JV9IRte43fTRICFWl4aPCuAjAFKbiO88DT4LTcDs7KvrlgWOrnQrS8OR5znUMBGfZANsMgs8GwIQIDAQAB\\n-----END PUBLIC KEY-----"
 
 jobs:
   test-and-deploy:
@@ -78,110 +84,97 @@ jobs:
         env:
           IMAGE: ${{ steps.image.outputs.uri }}
         run: |
-          kubectl apply -f k8s/namespace.yaml -f k8s/service-account.yaml
-          kubectl delete job backend-migrate \
-            --namespace="$GKE_NAMESPACE" --ignore-not-found
-          envsubst < k8s/migration-job.yaml | kubectl apply -f -
-          if ! kubectl wait --for=condition=complete job/backend-migrate \
-            --namespace="$GKE_NAMESPACE" --timeout=300s; then
-            kubectl describe job/backend-migrate --namespace="$GKE_NAMESPACE"
-            kubectl get pods --namespace="$GKE_NAMESPACE" \
-              --selector=job-name=backend-migrate --output=wide
-            kubectl logs job/backend-migrate --namespace="$GKE_NAMESPACE" \
-              --all-containers=true --tail=200 || true
-            exit 1
-          fi
+          gcloud run jobs deploy backend-migrate \
+            --project="$PROJECT_ID" \
+            --region="$REGION" \
+            --image="$IMAGE" \
+            --service-account="$RUNTIME_SERVICE_ACCOUNT" \
+            --set-cloudsql-instances="${{ vars.GCP_CLOUD_SQL_CONNECTION_NAME }}" \
+            --set-env-vars="INSTANCE_CONNECTION_NAME=${{ vars.GCP_CLOUD_SQL_CONNECTION_NAME }},IAM_DB_USER=${{ vars.GCP_CLOUD_SQL_IAM_USER }},DB_NAME=app" \
+            --command=python \
+            --args=-m,alembic,upgrade,head \
+            --cpu=1 \
+            --memory=512Mi \
+            --max-retries=1 \
+            --task-timeout=300s \
+            --execute-now \
+            --wait \
+            --quiet
 
-      - name: Deploy new Cloud Run revision
-        id: deploy
-        uses: google-github-actions/deploy-cloudrun@v3
-        with:
-          project_id: ${{ env.PROJECT_ID }}
-          region: ${{ env.REGION }}
-          service: ${{ env.CLOUD_RUN_SERVICE }}
-          image: ${{ steps.image.outputs.uri }}
-          env_vars: |-
-            INSTANCE_CONNECTION_NAME=${{ vars.GCP_CLOUD_SQL_CONNECTION_NAME }}
-            IAM_DB_USER=${{ vars.GCP_CLOUD_SQL_IAM_USER }}
-            DB_NAME=app
-            GOOGLE_CLOUD_PROJECT=${{ env.PROJECT_ID }}
-            GOOGLE_CLOUD_LOCATION=global
-            GOOGLE_GENAI_USE_VERTEXAI=true
-            GEMINI_MODEL=gemini-3.6-flash
-            ROLLBACKREADY_SANDBOX_BACKEND=native
-            ROLLBACKREADY_POSTGRES_BIN=/usr/lib/postgresql/18/bin
-            ROLLBACKREADY_PERSIST_REPORTS=true
-            ROLLBACKREADY_TOTAL_RUNTIME_SECONDS=90
-            ROLLBACKREADY_MAX_TOTAL_ROWS=10000
-            ROLLBACKREADY_MAX_ACTIVE_ANALYSES=25
-            ROLLBACKREADY_CREATE_RATE_LIMIT_PER_MINUTE=10
-            CLERK_AUTH_REQUIRED=false
-          flags: >-
-            --port=8080
-            --service-account=${{ env.RUNTIME_SERVICE_ACCOUNT }}
-            --cpu=1
-            --memory=2Gi
-            --concurrency=1
-            --min-instances=1
-            --max-instances=1
-
-      - name: Verify deployed RollbackReady API
+      - name: Deploy autoscaled production backend
         shell: bash
         env:
-          SERVICE_URL: ${{ steps.deploy.outputs.url }}
+          IMAGE: ${{ steps.image.outputs.uri }}
         run: |
-          python - <<'PY'
-          import json
-          import os
-          import time
-          import urllib.request
-
-          base_url = os.environ["SERVICE_URL"].rstrip("/")
-          last_error = None
-          for _ in range(12):
-              try:
-                  with urllib.request.urlopen(f"{base_url}/openapi.json", timeout=15) as response:
-                      document = json.load(response)
-                  assert document["info"]["title"] == "RollbackReady API"
-                  assert document["info"]["version"] == "0.3.0"
-                  assert "/api/v1/analyses" in document["paths"]
-                  break
-              except Exception as exc:
-                  last_error = exc
-                  time.sleep(5)
-          else:
-              raise SystemExit(f"deployed API did not become current: {last_error}")
-          PY
+          gcloud run services update nycr3s1-backend \
+            --project="$PROJECT_ID" \
+            --region="$REGION" \
+            --image="$IMAGE" \
+            --min=2 \
+            --max=20 \
+            --concurrency=3 \
+            --cpu=1 \
+            --memory=2Gi \
+            --timeout=300 \
+            --quiet
 
       - name: Deploy to GKE
         shell: bash
         env:
           IMAGE: ${{ steps.image.outputs.uri }}
+          CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
+          CLERK_JWT_KEY: ${{ env.CLERK_JWT_KEY }}
+          CLERK_ISSUER: ${{ env.CLERK_ISSUER }}
+          CLERK_AUTHORIZED_PARTIES: ${{ env.CLERK_AUTHORIZED_PARTIES }}
+          CLERK_JWKS_URL: ${{ env.CLERK_JWKS_URL }}
         run: |
+          kubectl create secret generic backend-auth-secrets \
+            --namespace="$GKE_NAMESPACE" \
+            --from-literal=CLERK_SECRET_KEY="$CLERK_SECRET_KEY" \
+            --from-literal=CLERK_JWT_KEY="$CLERK_JWT_KEY" \
+            --dry-run=client --output=yaml | kubectl apply -f -
           envsubst < k8s/deployment.yaml | kubectl apply -f -
           kubectl apply -f k8s/backend-config.yaml
           kubectl apply \
-            -f k8s/service.yaml \
             -f k8s/ingress-service.yaml \
             -f k8s/hpa.yaml
           kubectl apply -f k8s/ingress.yaml
           kubectl rollout status deployment/backend \
-            --namespace="$GKE_NAMESPACE" --timeout=300s
+            --namespace="$GKE_NAMESPACE" --timeout=600s
+          test "$(kubectl get hpa backend --namespace="$GKE_NAMESPACE" \
+            --output=jsonpath='{.spec.minReplicas}')" = "1"
+          test "$(kubectl get hpa backend --namespace="$GKE_NAMESPACE" \
+            --output=jsonpath='{.spec.maxReplicas}')" = "20"
+          kubectl get deployment/backend hpa/backend \
+            --namespace="$GKE_NAMESPACE" --output=wide
 
-      - name: Publish service URL
+      - name: Verify GKE RollbackReady API
         shell: bash
         run: |
-          echo "Cloud Run URL - ${{ steps.deploy.outputs.url }}" >> "$GITHUB_STEP_SUMMARY"
-          for _ in {1..36}; do
-            GKE_IP="$(kubectl get service backend-public \
-              --namespace="$GKE_NAMESPACE" \
-              --output=jsonpath='{.status.loadBalancer.ingress[0].ip}')"
-            if [[ -n "$GKE_IP" ]]; then
-              echo "GKE rollback URL - http://$GKE_IP" >> "$GITHUB_STEP_SUMMARY"
-              break
-            fi
-            sleep 5
-          done
+          python - <<'PY'
+          import json
+          import time
+          import urllib.request
+
+          url = "https://api.r3.get200.qd.je/health/ready"
+          last_error = None
+          for _ in range(24):
+              try:
+                  with urllib.request.urlopen(url, timeout=15) as response:
+                      document = json.load(response)
+                  assert document["status"] == "ready"
+                  assert document["database"]["connected"] is True
+                  break
+              except Exception as exc:
+                  last_error = exc
+                  time.sleep(5)
+          else:
+              raise SystemExit(f"GKE API did not become ready: {last_error}")
+          PY
+
+      - name: Publish GKE ingress URL
+        shell: bash
+        run: |
           INGRESS_IP="$(kubectl get ingress backend-ingress \
             --namespace="$GKE_NAMESPACE" \
             --output=jsonpath='{.status.loadBalancer.ingress[0].ip}')"

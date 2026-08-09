@@ -1,7 +1,10 @@
+from dataclasses import replace
 from datetime import UTC, datetime
 
 from fastapi.testclient import TestClient
 
+import app.main as main_module
+from app.core.config import settings
 from app.main import create_app
 
 
@@ -84,3 +87,25 @@ def test_openapi_document_is_available() -> None:
     document = response.json()
     assert document["info"]["title"] == "RollbackReady API"
     assert "/api/v1/analyses" in document["paths"]
+
+
+def test_production_frontend_cors_preflight(monkeypatch) -> None:
+    origin = "https://dbsentinal.get200.qd.je"
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        replace(settings, cors_origins=(origin,)),
+    )
+
+    with TestClient(create_app(database_result)) as client:
+        response = client.options(
+            "/api/v1/analyses",
+            headers={
+                "Origin": origin,
+                "Access-Control-Request-Method": "POST",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == origin
+    assert "POST" in response.headers["access-control-allow-methods"]

@@ -33,6 +33,12 @@ class Verdict(StrEnum):
     ERROR = "ERROR"
 
 
+class InsightKind(StrEnum):
+    FINDING_EXPLANATIONS = "finding_explanations"
+    MIGRATION_SUMMARY = "migration_summary"
+    PLAN_REJECTION = "plan_rejection"
+
+
 class EvidenceLevel(StrEnum):
     STATIC_ANALYSIS_ONLY = "STATIC_ANALYSIS_ONLY"
     SANDBOX_SIMULATED = "SANDBOX_SIMULATED"
@@ -109,6 +115,8 @@ class ArtifactManifest(BaseModel):
     has_lockfile: bool
     has_seed: bool
     legacy_query_count: int = Field(ge=0)
+    fixture_source: Literal["user_supplied", "synthesized"] | None = None
+    legacy_query_source: Literal["user_supplied", "synthesized"] | None = None
 
 
 class LegacyQuery(BaseModel):
@@ -231,6 +239,50 @@ class RecoveryPlan(GeneratedPlanPayload):
     deterministic_fallback: bool = False
 
 
+class SchemaChatTurn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=4_000)
+
+
+class SchemaChatRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message: str = Field(min_length=1, max_length=2_000)
+    history: list[SchemaChatTurn] = Field(default_factory=list, max_length=10)
+
+
+class SchemaChatPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    answer: str = Field(min_length=1, max_length=6_000)
+    suggested_questions: list[str] = Field(default_factory=list, max_length=4)
+
+
+class SchemaChatResponse(SchemaChatPayload):
+    analysis_id: str
+    provider: str
+    model: str
+    prompt_template_version: str
+    disclaimer: str = (
+        "Advisory explanation only. Execute and verify every proposed change in a fresh sandbox."
+    )
+
+
+class AIInsight(BaseModel):
+    id: str
+    analysis_id: str
+    kind: InsightKind
+    content: str = Field(min_length=1, max_length=6_000)
+    derived_from: list[str] = Field(default_factory=list, max_length=100)
+    provider: str
+    model: str
+    prompt_template_version: str
+    generated_at: datetime
+    disclaimer: str = "Advisory explanation only; human review is required."
+
+
 class VerificationResult(BaseModel):
     id: str
     plan_id: str
@@ -243,6 +295,7 @@ class VerificationResult(BaseModel):
 
 class AnalysisSummary(BaseModel):
     id: str
+    auth_mode: Literal["required", "anonymous_demo"] = "anonymous_demo"
     status: AnalysisStatus
     evidence_level: EvidenceLevel
     verdict: Verdict
@@ -259,6 +312,7 @@ class AnalysisSummary(BaseModel):
     legacy_query_results: list[LegacyQueryResult] = Field(default_factory=list)
     plans: list[RecoveryPlan] = Field(default_factory=list)
     verification_results: list[VerificationResult] = Field(default_factory=list)
+    insights: list[AIInsight] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
 
 

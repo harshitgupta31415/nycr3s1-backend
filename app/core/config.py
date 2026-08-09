@@ -27,8 +27,10 @@ class Settings:
     clerk_jwt_key: str | None = None
     clerk_issuer: str | None = None
     clerk_authorized_parties: tuple[str, ...] = ()
+    clerk_auth_mode: str = "anonymous_demo"
     google_cloud_project: str | None = None
     google_cloud_location: str = "global"
+    gemini_api_key: str | None = None
     google_genai_use_vertexai: bool = True
     gemini_model: str = "gemini-3.6-flash"
     rollbackready_sandbox_backend: str = "auto"
@@ -44,6 +46,7 @@ class Settings:
     rollbackready_verify_rate_limit_per_hour: int = 5
     rollbackready_max_plans_per_analysis: int = 3
     rollbackready_max_unfinished_per_user: int = 5
+    rollbackready_privileged_clerk_user_ids: frozenset[str] = frozenset()
     rollbackready_persist_reports: bool = False
     rollbackready_artifact_bucket: str | None = None
     rollbackready_artifact_retention_hours: int = 24
@@ -60,8 +63,28 @@ class Settings:
             for party in os.getenv("CLERK_AUTHORIZED_PARTIES", "").split(",")
             if party.strip()
         )
+        privileged_clerk_user_ids = frozenset(
+            user_id.strip()
+            for user_id in os.getenv(
+                "ROLLBACKREADY_PRIVILEGED_CLERK_USER_IDS", ""
+            ).split(",")
+            if user_id.strip()
+        )
         use_vertex_ai = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "true").strip().lower()
-        return cls(
+        legacy_auth_required = os.getenv("CLERK_AUTH_REQUIRED", "false").strip().lower()
+        auth_mode = os.getenv("CLERK_AUTH_MODE")
+        if auth_mode is None:
+            auth_mode = (
+                "required"
+                if legacy_auth_required in {"1", "true", "yes", "on"}
+                else "anonymous_demo"
+            )
+        auth_mode = auth_mode.strip().lower()
+        if auth_mode not in {"required", "anonymous_demo"}:
+            raise RuntimeError(
+                "CLERK_AUTH_MODE must be either 'required' or 'anonymous_demo'."
+            )
+        configured = cls(
             instance_connection_name=os.getenv("INSTANCE_CONNECTION_NAME"),
             iam_database_user=os.getenv("IAM_DB_USER"),
             database_name=os.getenv("DB_NAME"),
@@ -71,8 +94,10 @@ class Settings:
             clerk_jwt_key=os.getenv("CLERK_JWT_KEY"),
             clerk_issuer=os.getenv("CLERK_ISSUER"),
             clerk_authorized_parties=authorized_parties,
+            clerk_auth_mode=auth_mode,
             google_cloud_project=os.getenv("GOOGLE_CLOUD_PROJECT"),
             google_cloud_location=os.getenv("GOOGLE_CLOUD_LOCATION", "global"),
+            gemini_api_key=os.getenv("GEMINI_API_KEY"),
             google_genai_use_vertexai=use_vertex_ai in {"1", "true", "yes", "on"},
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.6-flash"),
             rollbackready_sandbox_backend=os.getenv(
@@ -112,6 +137,7 @@ class Settings:
             rollbackready_max_unfinished_per_user=int(
                 os.getenv("ROLLBACKREADY_MAX_UNFINISHED_PER_USER", "5")
             ),
+            rollbackready_privileged_clerk_user_ids=privileged_clerk_user_ids,
             rollbackready_persist_reports=os.getenv(
                 "ROLLBACKREADY_PERSIST_REPORTS", "false"
             ).strip().lower()
@@ -121,6 +147,31 @@ class Settings:
                 os.getenv("ROLLBACKREADY_ARTIFACT_RETENTION_HOURS", "24")
             ),
         )
+        configured.validate_auth_configuration()
+        return configured
+
+    @property
+    def clerk_auth_required(self) -> bool:
+        return self.clerk_auth_mode == "required"
+
+    def is_privileged_clerk_user(self, clerk_user_id: str) -> bool:
+        """Return whether an authenticated account bypasses usage quotas."""
+        return clerk_user_id in self.rollbackready_privileged_clerk_user_ids
+
+    def validate_auth_configuration(self) -> None:
+        if not self.clerk_auth_required:
+            return
+        missing: list[str] = []
+        if not self.clerk_jwt_key:
+            missing.append("CLERK_JWT_KEY")
+        if not self.clerk_issuer:
+            missing.append("CLERK_ISSUER")
+        if not self.clerk_authorized_parties:
+            missing.append("CLERK_AUTHORIZED_PARTIES")
+        if missing:
+            raise RuntimeError(
+                "Clerk required mode is missing: " + ", ".join(missing)
+            )
 
     @property
     def sync_database_url(self) -> str | None:

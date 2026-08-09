@@ -13,7 +13,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Lock
+from threading import BoundedSemaphore
 from typing import Self
 
 from app.core.config import settings
@@ -26,7 +26,9 @@ ADMIN_USER = "rr_admin"
 MIGRATION_USER = "rr_migrator"
 COMMAND_TIMEOUT_SECONDS = 90
 
-_simulation_lock = Lock()
+_simulation_slots = BoundedSemaphore(
+    value=max(1, settings.rollbackready_max_active_analyses)
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -649,10 +651,10 @@ class PostgresSandbox:
 
 @contextmanager
 def acquire_sandbox(analysis_id: str) -> Iterator[PostgresSandbox]:
-    if not _simulation_lock.acquire(blocking=False):
+    if not _simulation_slots.acquire(blocking=False):
         raise RollbackReadyError(
             "SIMULATOR_BUSY",
-            "This instance is already running a simulation. Retry shortly.",
+            "This instance is using all isolated simulation slots. Retry shortly.",
             status_code=409,
             analysis_id=analysis_id,
         )
@@ -660,7 +662,7 @@ def acquire_sandbox(analysis_id: str) -> Iterator[PostgresSandbox]:
         with PostgresSandbox(analysis_id) as sandbox:
             yield sandbox
     finally:
-        _simulation_lock.release()
+        _simulation_slots.release()
 
 
 def _affected_rows(output: str) -> int | None:

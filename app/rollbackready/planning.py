@@ -75,7 +75,7 @@ class RecoveryPlanner:
         )
 
     def _gemini_node(self, state: _PlannerState) -> dict[str, GeneratedPlanPayload | None]:
-        if not settings.google_cloud_project:
+        if not settings.google_cloud_project and not settings.gemini_api_key:
             return {"payload": None}
         try:
             model = ChatGoogleGenerativeAI(
@@ -84,6 +84,7 @@ class RecoveryPlanner:
                 retries=0,
                 request_timeout=25,
                 seed=7,
+                google_api_key=settings.gemini_api_key,
                 vertexai=settings.google_genai_use_vertexai,
                 project=settings.google_cloud_project,
                 location=settings.google_cloud_location,

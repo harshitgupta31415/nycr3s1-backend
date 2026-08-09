@@ -47,6 +47,7 @@ def signing_material() -> tuple[bytes, str]:
 def configured_settings(public_key: str) -> Settings:
     return replace(
         unconfigured_settings(),
+        clerk_auth_mode="required",
         clerk_jwt_key=public_key,
         clerk_issuer="https://issuer.example",
         clerk_authorized_parties=("https://app.example",),
@@ -68,10 +69,27 @@ def test_auth_module_imports_without_clerk_credentials() -> None:
 
 
 def test_unconfigured_auth_returns_controlled_error(monkeypatch) -> None:
-    monkeypatch.setattr(clerk_auth, "settings", unconfigured_settings())
+    monkeypatch.setattr(
+        clerk_auth,
+        "settings",
+        replace(unconfigured_settings(), clerk_auth_mode="required"),
+    )
     with pytest.raises(HTTPException) as raised:
         asyncio.run(clerk_auth.get_current_user(request_with_token()))
     assert raised.value.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+
+
+def test_anonymous_demo_mode_returns_uniform_principal(monkeypatch) -> None:
+    monkeypatch.setattr(clerk_auth, "settings", unconfigured_settings())
+
+    payload = asyncio.run(clerk_auth.get_current_user(request_with_token()))
+
+    assert payload == {
+        "sub": clerk_auth.ANONYMOUS_USER_ID,
+        "auth_mode": "anonymous_demo",
+        "org_id": None,
+        "org_role": None,
+    }
 
 
 def test_configured_auth_rejects_unsigned_request(monkeypatch) -> None:

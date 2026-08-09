@@ -26,7 +26,10 @@ def _create_database_engine() -> Engine:
     global _connector
 
     engine_options = {
-        "pool_size": 5,
+        # Match the three bounded simulation slots per instance. With the
+        # regional 20-instance ceiling this caps the application at 60 pooled
+        # metadata connections while simulations run in disposable local PG.
+        "pool_size": 3,
         "max_overflow": 0,
         "pool_timeout": 10,
         "pool_recycle": 1800,

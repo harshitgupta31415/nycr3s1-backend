@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import io
 import json
@@ -22,6 +23,7 @@ from app.rollbackready.errors import RollbackReadyError
 from app.rollbackready.sql import (
     MAX_LEGACY_QUERIES,
     PolicyStatement,
+    split_sql,
     sql_hash,
     validate_sql_policy,
 )
@@ -31,6 +33,8 @@ MAX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 250
 MAX_COMPRESSION_RATIO = 200
 MAX_ARTIFACT_BYTES = 10 * 1024 * 1024
+MAX_FIXTURE_ROWS = 1_000
+MAX_FIXTURE_CELL_LENGTH = 2_000
 NESTED_ARCHIVE_SUFFIXES = {".zip", ".tar", ".tgz", ".gz", ".bz2", ".xz", ".7z", ".rar"}
 
 
@@ -49,6 +53,20 @@ class ProjectBundle:
     @property
     def ready_for_simulation(self) -> bool:
         return self.evidence_level is EvidenceLevel.SANDBOX_SIMULATED
+
+
+@dataclass(frozen=True, slots=True)
+class _BaselineColumn:
+    name: str
+    data_type: str
+    required: bool
+    generated: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _BaselineTable:
+    name: str
+    columns: tuple[_BaselineColumn, ...]
 
 
 def load_project_bundle(archive: bytes, candidate_migration: str) -> ProjectBundle:
@@ -128,9 +146,26 @@ def load_project_bundle(archive: bytes, candidate_migration: str) -> ProjectBund
             prior.append((folder, sql))
 
     seed = _decode_optional(files, "rollbackready/seed.sql")
+    fixture_source: str | None = None
     if seed is not None:
         validate_sql_policy(seed)
-    legacy = _load_legacy_queries(files.get("rollbackready/legacy-queries.json"))
+        fixture_source = "user_supplied"
+    else:
+        seed = _seed_from_csv(files)
+        if seed is not None:
+            fixture_source = "user_supplied"
+        else:
+            seed = _synthesize_seed(tuple(prior))
+            if seed is not None:
+                fixture_source = "synthesized"
+
+    legacy_content = files.get("rollbackready/legacy-queries.json")
+    legacy = _load_legacy_queries(legacy_content)
+    legacy_query_source: str | None = "user_supplied" if legacy_content else None
+    if not legacy:
+        legacy = _synthesize_legacy_queries(tuple(prior))
+        if legacy:
+            legacy_query_source = "synthesized"
 
     has_verified_inputs = bool(
         provider == "postgresql"
@@ -162,6 +197,8 @@ def load_project_bundle(archive: bytes, candidate_migration: str) -> ProjectBund
         has_lockfile=lockfile is not None,
         has_seed=seed is not None,
         legacy_query_count=len(legacy),
+        fixture_source=fixture_source,
+        legacy_query_source=legacy_query_source,
     )
     return ProjectBundle(
         manifest=manifest,
@@ -378,6 +415,246 @@ def _lock_provider(lockfile: str | None) -> str | None:
         return None
     match = re.search(r'^\s*provider\s*=\s*"([^"]+)"', lockfile, re.IGNORECASE | re.MULTILINE)
     return match.group(1).lower() if match else None
+
+
+def _seed_from_csv(files: dict[str, bytes]) -> str | None:
+    statements: list[str] = []
+    total_rows = 0
+    for path, content in sorted(files.items()):
+        match = re.fullmatch(r"rollbackready/fixtures/([^/]+)\.csv", path)
+        if match is None:
+            match = re.fullmatch(r"([^/]+)\.csv", path)
+        if match is None:
+            continue
+        table = _quote_identifier(match.group(1), path)
+        text = _decode_required(content, path)
+        try:
+            rows = list(csv.reader(io.StringIO(text, newline="")))
+        except csv.Error as exc:
+            raise RollbackReadyError(
+                "INVALID_CSV_FIXTURE",
+                "A CSV fixture could not be parsed.",
+                details={"path": path},
+            ) from exc
+        if not rows or not rows[0] or any(not item.strip() for item in rows[0]):
+            raise RollbackReadyError(
+                "INVALID_CSV_FIXTURE",
+                "CSV fixtures require a non-empty header row.",
+                details={"path": path},
+            )
+        headers = [_quote_identifier(item.strip(), path) for item in rows[0]]
+        values: list[str] = []
+        for row in rows[1:]:
+            total_rows += 1
+            if total_rows > MAX_FIXTURE_ROWS:
+                raise RollbackReadyError(
+                    "FIXTURE_ROW_LIMIT_EXCEEDED",
+                    f"CSV fixtures support at most {MAX_FIXTURE_ROWS} rows.",
+                )
+            if len(row) != len(headers):
+                raise RollbackReadyError(
+                    "INVALID_CSV_FIXTURE",
+                    "Every CSV row must match the header column count.",
+                    details={"path": path},
+                )
+            encoded: list[str] = []
+            for cell in row:
+                if len(cell) > MAX_FIXTURE_CELL_LENGTH:
+                    raise RollbackReadyError(
+                        "FIXTURE_CELL_TOO_LARGE",
+                        "A CSV fixture cell exceeds the safe length limit.",
+                        details={"path": path, "limit": MAX_FIXTURE_CELL_LENGTH},
+                    )
+                encoded.append("NULL" if cell == "" else _sql_string(cell))
+            values.append("(" + ", ".join(encoded) + ")")
+        if values:
+            statements.append(
+                f"INSERT INTO {table} ({', '.join(headers)}) VALUES "
+                + ", ".join(values)
+            )
+    if not statements:
+        return None
+    seed = ";\n".join(statements) + ";"
+    validate_sql_policy(seed)
+    return seed
+
+
+def _synthesize_seed(prior: tuple[tuple[str, str], ...]) -> str | None:
+    statements: list[str] = []
+    for table in _baseline_tables(prior):
+        columns = [column for column in table.columns if not column.generated]
+        if not columns:
+            continue
+        rows = [
+            "(" + ", ".join(_synthetic_value(table.name, column, row) for column in columns) + ")"
+            for row in range(1, 4)
+        ]
+        statements.append(
+            f"INSERT INTO {table.name} "
+            f"({', '.join(column.name for column in columns)}) VALUES "
+            + ", ".join(rows)
+        )
+    if not statements:
+        return None
+    seed = ";\n".join(statements) + ";"
+    validate_sql_policy(seed)
+    return seed
+
+
+def _synthesize_legacy_queries(
+    prior: tuple[tuple[str, str], ...]
+) -> tuple[LegacyQuery, ...]:
+    queries: list[LegacyQuery] = []
+    for table in _baseline_tables(prior):
+        if len(queries) >= MAX_LEGACY_QUERIES:
+            break
+        columns = [column.name for column in table.columns]
+        select_columns = ", ".join(columns) if columns else "*"
+        queries.append(
+            LegacyQuery(
+                name=f"synthesized-select-{_plain_identifier(table.name)}",
+                sql=f"SELECT {select_columns} FROM {table.name} LIMIT 1",
+            )
+        )
+        if len(queries) >= MAX_LEGACY_QUERIES:
+            break
+        writable = [column for column in table.columns if not column.generated]
+        if writable:
+            insert_sql = (
+                f"INSERT INTO {table.name} "
+                f"({', '.join(column.name for column in writable)}) VALUES "
+                "("
+                + ", ".join(
+                    _synthetic_value(table.name, column, 1001) for column in writable
+                )
+                + ")"
+            )
+        else:
+            insert_sql = f"INSERT INTO {table.name} DEFAULT VALUES"
+        queries.append(
+            LegacyQuery(
+                name=f"synthesized-insert-{_plain_identifier(table.name)}",
+                sql=insert_sql,
+                expected_affected_rows=1,
+            )
+        )
+    for query in queries:
+        validate_sql_policy(query.sql, legacy_query=True)
+    return tuple(queries)
+
+
+def _baseline_tables(prior: tuple[tuple[str, str], ...]) -> tuple[_BaselineTable, ...]:
+    tables: list[_BaselineTable] = []
+    for _, script in prior:
+        for statement in split_sql(script):
+            match = re.match(
+                r"^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+                r"(?P<table>(?:\"?[A-Za-z_][A-Za-z0-9_]*\"?\.)?"
+                r"\"?[A-Za-z_][A-Za-z0-9_]*\"?)\s*\((?P<body>[\s\S]*)\)\s*$",
+                statement.strip(),
+                re.IGNORECASE,
+            )
+            if match is None:
+                continue
+            table_name = _safe_table_identifier(match.group("table"))
+            columns: list[_BaselineColumn] = []
+            for definition in _split_comma_definitions(match.group("body")):
+                if re.match(
+                    r"^(?:CONSTRAINT|PRIMARY|UNIQUE|FOREIGN|CHECK|EXCLUDE)\b",
+                    definition,
+                    re.IGNORECASE,
+                ):
+                    continue
+                column = re.match(
+                    r"^(?P<name>\"?[A-Za-z_][A-Za-z0-9_]*\"?)\s+"
+                    r"(?P<type>[A-Za-z][A-Za-z0-9_]*(?:\s+varying)?"
+                    r"(?:\s*\([^)]*\))?(?:\[\])?)(?P<rest>[\s\S]*)$",
+                    definition,
+                    re.IGNORECASE,
+                )
+                if column is None:
+                    continue
+                data_type = column.group("type").strip()
+                rest = column.group("rest")
+                generated = bool(
+                    re.search(r"\b(?:SERIAL|DEFAULT|GENERATED)\b", data_type + " " + rest, re.IGNORECASE)
+                )
+                required = bool(
+                    re.search(r"\b(?:NOT\s+NULL|PRIMARY\s+KEY)\b", rest, re.IGNORECASE)
+                )
+                columns.append(
+                    _BaselineColumn(
+                        name=_quote_identifier(column.group("name").strip('"'), "migration"),
+                        data_type=data_type,
+                        required=required,
+                        generated=generated,
+                    )
+                )
+            if columns:
+                tables.append(_BaselineTable(table_name, tuple(columns)))
+    return tuple(tables)
+
+
+def _split_comma_definitions(body: str) -> list[str]:
+    parts: list[str] = []
+    start = 0
+    depth = 0
+    quoted = False
+    for index, character in enumerate(body):
+        if character == '"':
+            quoted = not quoted
+        elif not quoted and character == "(":
+            depth += 1
+        elif not quoted and character == ")":
+            depth = max(0, depth - 1)
+        elif not quoted and depth == 0 and character == ",":
+            parts.append(body[start:index].strip())
+            start = index + 1
+    tail = body[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _synthetic_value(table: str, column: _BaselineColumn, row: int) -> str:
+    normalized = column.data_type.lower()
+    if any(token in normalized for token in ("int", "numeric", "decimal", "real", "double")):
+        return str(row)
+    if "bool" in normalized:
+        return "TRUE" if row % 2 else "FALSE"
+    if "timestamp" in normalized or normalized == "date":
+        return _sql_string(f"2026-01-{(row % 28) + 1:02d}")
+    if "uuid" in normalized:
+        return _sql_string(f"00000000-0000-4000-8000-{row:012d}")
+    if "json" in normalized:
+        return _sql_string("{}")
+    label = f"rr_{_plain_identifier(table)}_{_plain_identifier(column.name)}_{row}"
+    return _sql_string(label[:120])
+
+
+def _safe_table_identifier(value: str) -> str:
+    parts = [part.strip('"') for part in value.split(".")]
+    if not parts or any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", part) for part in parts):
+        raise RollbackReadyError("INVALID_IDENTIFIER", "A migration used an unsafe table identifier.")
+    return ".".join(f'"{part}"' for part in parts)
+
+
+def _quote_identifier(value: str, path: str) -> str:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+        raise RollbackReadyError(
+            "INVALID_FIXTURE_IDENTIFIER",
+            "Fixture table and column names must be simple SQL identifiers.",
+            details={"path": path},
+        )
+    return f'"{value}"'
+
+
+def _plain_identifier(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_]+", "_", value.strip('"')).strip("_")[:80]
+
+
+def _sql_string(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
 
 
 def _load_legacy_queries(content: bytes | None) -> tuple[LegacyQuery, ...]:

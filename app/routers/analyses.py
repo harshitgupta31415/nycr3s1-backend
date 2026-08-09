@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Annotated
 
 from fastapi import (
@@ -8,18 +9,24 @@ from fastapi import (
     File,
     Form,
     Header,
+    Query,
     Request,
     Response,
     UploadFile,
     status,
 )
+from fastapi.responses import StreamingResponse
 
 from app.core.clerk_auth import get_clerk_user_id
 from app.core.config import settings
 from app.rollbackready.contracts import (
+    AIInsight,
     AnalysisSummary,
     EvidenceReport,
+    InsightKind,
     RecoveryPlan,
+    SchemaChatRequest,
+    SchemaChatResponse,
     TimelineEvent,
     VerificationResult,
 )
@@ -30,7 +37,7 @@ from app.rollbackready.intake import (
     load_demo_bundle,
     load_project_bundle,
 )
-from app.rollbackready.service import AnalysisService
+from app.rollbackready.service import TERMINAL_ANALYSIS_STATUSES, AnalysisService
 
 ClerkUserId = Annotated[str, Depends(get_clerk_user_id)]
 IdempotencyKey = Annotated[
@@ -148,6 +155,42 @@ def create_analyses_router(service: AnalysisService) -> APIRouter:
     ) -> list[TimelineEvent]:
         return service.timeline(analysis_id, clerk_user_id)
 
+    @router.get("/analyses/{analysis_id}/events")
+    def stream_timeline_events(
+        analysis_id: str,
+        clerk_user_id: ClerkUserId,
+        after_sequence: Annotated[int, Query(ge=0)] = 0,
+    ) -> StreamingResponse:
+        service.get(analysis_id, clerk_user_id)
+
+        def event_stream():
+            cursor = after_sequence
+            while True:
+                events, analysis_status = service.wait_for_timeline_events(
+                    analysis_id,
+                    clerk_user_id,
+                    cursor,
+                )
+                if not events:
+                    yield ": heartbeat\n\n"
+                for event in events:
+                    cursor = event.sequence
+                    payload = json.dumps(event.model_dump(mode="json"), separators=(",", ":"))
+                    yield f"id: {event.sequence}\nevent: timeline\ndata: {payload}\n\n"
+                if analysis_status in TERMINAL_ANALYSIS_STATUSES:
+                    yield f"event: complete\ndata: {{\"status\":\"{analysis_status}\"}}\n\n"
+                    break
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     @router.post(
         "/analyses/{analysis_id}/plans",
         response_model=RecoveryPlan,
@@ -174,6 +217,32 @@ def create_analyses_router(service: AnalysisService) -> APIRouter:
                 3600,
             ),
         )
+
+    @router.post(
+        "/analyses/{analysis_id}/chat",
+        response_model=SchemaChatResponse,
+    )
+    def chat_schema_change(
+        analysis_id: str,
+        payload: SchemaChatRequest,
+        clerk_user_id: ClerkUserId,
+        request: Request,
+    ) -> SchemaChatResponse:
+        client = request.client.host if request.client else "unknown"
+        service.check_rate_limit(clerk_user_id, "chat", 20, 60, client)
+        return service.chat_schema_change(analysis_id, payload, clerk_user_id)
+
+    @router.post(
+        "/analyses/{analysis_id}/insights",
+        response_model=AIInsight,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def create_insight(
+        analysis_id: str,
+        kind: Annotated[InsightKind, Query()],
+        clerk_user_id: ClerkUserId,
+    ) -> AIInsight:
+        return service.create_insight(analysis_id, kind, clerk_user_id)
 
     @router.post(
         "/analyses/{analysis_id}/plans/{plan_id}/verify",

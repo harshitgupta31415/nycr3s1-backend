@@ -26,6 +26,7 @@ from app.models.rollbackready import (
     VerificationResultRecord,
 )
 from app.rollbackready.contracts import (
+    AIInsight,
     AnalysisSummary,
     ArtifactManifest,
     EvidenceDimension,
@@ -257,8 +258,10 @@ class SqlAlchemyEvidenceRepository:
                         AnalysisRecord.status.in_(_UNFINISHED_STATUSES),
                     )
                 )
-                if (unfinished or 0) >= max(
-                    1, settings.rollbackready_max_unfinished_per_user
+                if (
+                    not settings.is_privileged_clerk_user(owner_clerk_user_id)
+                    and (unfinished or 0)
+                    >= max(1, settings.rollbackready_max_unfinished_per_user)
                 ):
                     raise RollbackReadyError(
                         "ANALYSIS_CAPACITY_REACHED",
@@ -284,6 +287,9 @@ class SqlAlchemyEvidenceRepository:
             analysis.candidate_migration = summary.candidate_migration
             analysis.manifest = summary.manifest.model_dump(mode="json")
             analysis.evidence = [item.model_dump(mode="json") for item in summary.evidence]
+            analysis.ai_insights = [
+                item.model_dump(mode="json") for item in summary.insights
+            ]
             analysis.limitations = summary.limitations
             analysis.created_at = summary.created_at
             analysis.updated_at = summary.updated_at
@@ -514,6 +520,9 @@ class SqlAlchemyEvidenceRepository:
                 ],
                 plans=plans,
                 verification_results=verifications,
+                insights=[
+                    AIInsight.model_validate(item) for item in record.ai_insights
+                ],
                 limitations=record.limitations,
             )
             timeline = [

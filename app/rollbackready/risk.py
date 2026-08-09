@@ -18,7 +18,6 @@ def analyze_risks(bundle: ProjectBundle) -> list[RiskFinding]:
 
 def _statement_findings(statement: PolicyStatement) -> list[RiskFinding]:
     sql = statement.sql
-    upper = sql.upper()
     findings: list[RiskFinding] = []
 
     drop_table = re.search(r"\bDROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?([\w.\"]+)", sql, re.IGNORECASE)
@@ -101,11 +100,11 @@ def _statement_findings(statement: PolicyStatement) -> list[RiskFinding]:
         )
 
     unique = re.search(
-        r"\b(?:CREATE\s+(?:UNIQUE\s+)?INDEX|ADD\s+(?:CONSTRAINT\s+[\w\"]+\s+)?UNIQUE)\b",
+        r"\b(?:CREATE\s+UNIQUE\s+INDEX|ADD\s+(?:CONSTRAINT\s+[\w\"]+\s+)?UNIQUE)\b",
         sql,
         re.IGNORECASE,
     )
-    if unique and "UNIQUE" in upper:
+    if unique:
         findings.append(
             _finding(
                 statement,
@@ -114,6 +113,40 @@ def _statement_findings(statement: PolicyStatement) -> list[RiskFinding]:
                 _first_table(sql),
                 "A unique index or constraint can fail when fixture data contains duplicate keys.",
                 "Run a duplicate preflight, resolve conflicts deterministically, then create the unique index.",
+            )
+        )
+
+    drop_type = re.search(
+        r"\bDROP\s+TYPE\s+(?:IF\s+EXISTS\s+)?([\w.\"]+)",
+        sql,
+        re.IGNORECASE,
+    )
+    if drop_type:
+        findings.append(
+            _finding(
+                statement,
+                Severity.CRITICAL,
+                "DESTRUCTIVE_DATA_LOSS",
+                _identifier(drop_type.group(1)),
+                "Dropping a PostgreSQL type can remove enum values and invalidate columns or application values that depend on that contract.",
+                "Keep the old enum contract during an expand-and-contract window, migrate dependent values explicitly, and drop it only after compatibility verification.",
+            )
+        )
+
+    rename_enum_value = re.search(
+        r"\bALTER\s+TYPE\s+([\w.\"]+)\s+RENAME\s+VALUE\s+'[^']+'\s+TO\s+'[^']+'",
+        sql,
+        re.IGNORECASE,
+    )
+    if rename_enum_value:
+        findings.append(
+            _finding(
+                statement,
+                Severity.HIGH,
+                "BACKWARD_INCOMPATIBILITY",
+                _identifier(rename_enum_value.group(1)),
+                "Renaming an enum value immediately breaks deployed clients that still read or write the previous literal.",
+                "Introduce a compatible replacement state in application code, migrate values after all readers accept both forms, then retire the old value contract.",
             )
         )
 

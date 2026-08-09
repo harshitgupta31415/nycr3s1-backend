@@ -157,8 +157,27 @@ class SimulationEngine:
                         else "At least one legacy query failed or produced an unexpected result."
                     ),
                 )
+                rollback_run = self._rollback_verification_run(sandbox, bundle)
+                runs.append(rollback_run)
+                rollback_status = rollback_run.status
+                rollback_summary = (
+                    rollback_run.recovery.summary
+                    if rollback_run.recovery
+                    else "Rollback recovery could not be classified."
+                )
+                _set_dimension(
+                    dimensions,
+                    "rollback_recovery",
+                    rollback_status,
+                    EvidenceSource.FIXTURE_EXECUTION,
+                    rollback_summary,
+                )
                 failure_runs = self._failure_injection_runs(
-                    sandbox, bundle, findings, normal_snapshot
+                    sandbox,
+                    bundle,
+                    findings,
+                    normal_snapshot,
+                    rollback_run.recovery,
                 )
                 runs.extend(failure_runs)
                 recovery_passed = all(
@@ -206,6 +225,13 @@ class SimulationEngine:
                     EvidenceStatus.NOT_TESTED,
                     EvidenceSource.LEGACY_REPLAY,
                     "Legacy queries were not replayed because the candidate migration did not apply.",
+                )
+                _set_dimension(
+                    dimensions,
+                    "rollback_recovery",
+                    EvidenceStatus.NOT_TESTED,
+                    EvidenceSource.FIXTURE_EXECUTION,
+                    "Rollback was not tested because the candidate migration did not apply.",
                 )
                 # A boundary-zero retry supplies deterministic recovery evidence even
                 # when no valid target schema can be established.
@@ -511,16 +537,116 @@ class SimulationEngine:
             )
         return results
 
+    def _rollback_verification_run(
+        self, sandbox: PostgresSandbox, bundle: ProjectBundle
+    ) -> SimulationRun:
+        started = time.monotonic()
+        setup_error = self._restore_baseline(sandbox, bundle, include_seed=True)
+        if setup_error:
+            return SimulationRun(
+                id=str(uuid4()),
+                run_type="ROLLBACK_VERIFICATION",
+                status=EvidenceStatus.FAIL,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                sanitized_error=setup_error,
+            )
+        before = sandbox.snapshot()
+        inverse, unsupported = _generate_inverse(sandbox, bundle)
+        if unsupported is not None:
+            classification = unsupported
+            return SimulationRun(
+                id=str(uuid4()),
+                run_type="ROLLBACK_VERIFICATION",
+                status=(
+                    EvidenceStatus.NOT_TESTED
+                    if classification is RecoveryClassification.NOT_APPLICABLE
+                    else EvidenceStatus.FAIL
+                ),
+                duration_ms=int((time.monotonic() - started) * 1000),
+                snapshot=before,
+                recovery=RecoveryAssessment(
+                    classification=classification,
+                    retry_outcome=RetryOutcome.NOT_ATTEMPTED,
+                    schema_matches_target=False,
+                    data_loss_possible=(
+                        classification
+                        is RecoveryClassification.EXTERNALLY_RECOVERABLE_ONLY
+                    ),
+                    summary=(
+                        "No deterministic inverse exists for this destructive operation; external recovery evidence is required."
+                        if classification
+                        is RecoveryClassification.EXTERNALLY_RECOVERABLE_ONLY
+                        else "The candidate contains no operation with a deterministic inverse."
+                    ),
+                ),
+            )
+        candidate = sandbox.execute(bundle.candidate_sql)
+        if not candidate.succeeded:
+            return SimulationRun(
+                id=str(uuid4()),
+                run_type="ROLLBACK_VERIFICATION",
+                status=EvidenceStatus.FAIL,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                sanitized_error=candidate.sanitized_error,
+                recovery=RecoveryAssessment(
+                    classification=RecoveryClassification.FORWARD_FIX_REQUIRED,
+                    retry_outcome=RetryOutcome.NOT_ATTEMPTED,
+                    schema_matches_target=False,
+                    data_loss_possible=False,
+                    summary="The candidate failed before its deterministic inverse could be tested.",
+                ),
+            )
+        inverse_script = sandbox.execute_statements(inverse)
+        after = sandbox.snapshot(content_columns=before.content_columns)
+        schema_restored = (
+            inverse_script.execution.succeeded and after.schema_hash == before.schema_hash
+        )
+        content_restored = schema_restored and all(
+            after.content_hashes.get(table) == content_hash
+            for table, content_hash in before.content_hashes.items()
+        )
+        if content_restored:
+            classification = RecoveryClassification.FULLY_REVERSIBLE
+            summary = "The inverse restored both the baseline schema and baseline-column content hashes."
+        elif schema_restored:
+            classification = RecoveryClassification.SCHEMA_REVERSIBLE
+            summary = "The inverse restored the schema, but baseline-column content hashes prove data changed."
+        else:
+            classification = RecoveryClassification.FORWARD_FIX_REQUIRED
+            summary = "The deterministic inverse did not restore the baseline schema; a forward fix is required."
+        return SimulationRun(
+            id=str(uuid4()),
+            run_type="ROLLBACK_VERIFICATION",
+            status=EvidenceStatus.PASS if schema_restored else EvidenceStatus.FAIL,
+            duration_ms=int((time.monotonic() - started) * 1000),
+            statements=_sql_statement_executions(inverse, inverse_script),
+            snapshot=after,
+            recovery=RecoveryAssessment(
+                classification=classification,
+                retry_outcome=RetryOutcome.NOT_ATTEMPTED,
+                schema_matches_target=schema_restored,
+                data_loss_possible=not content_restored,
+                summary=summary,
+            ),
+            sanitized_error=inverse_script.execution.sanitized_error,
+        )
+
     def _failure_injection_runs(
         self,
         sandbox: PostgresSandbox,
         bundle: ProjectBundle,
         findings: list[RiskFinding],
         target: SnapshotSummary,
+        rollback_recovery: RecoveryAssessment | None = None,
     ) -> list[SimulationRun]:
         statement_count = len(bundle.candidate_statements)
         boundaries = list(range(statement_count + 1))
         destructive = any(f.category == "DESTRUCTIVE_DATA_LOSS" for f in findings)
+        measured_data_loss = (
+            rollback_recovery.data_loss_possible
+            if rollback_recovery is not None
+            else destructive
+        )
         explicit_transaction = (
             statement_count >= 2
             and bundle.candidate_statements[0].kind == "BEGIN"
@@ -552,7 +678,9 @@ class SimulationEngine:
             retry = sandbox.execute(bundle.candidate_sql)
             final = sandbox.snapshot(content_columns=target.content_columns)
             matches = retry.succeeded and final.schema_hash == target.schema_hash
-            data_loss_possible = destructive and boundary > 0 and not explicit_transaction
+            data_loss_possible = (
+                measured_data_loss and boundary > 0 and not explicit_transaction
+            )
             if matches:
                 retry_outcome = (
                     RetryOutcome.IDEMPOTENT if boundary else RetryOutcome.SUCCESSFUL
@@ -646,6 +774,7 @@ def empty_dimensions() -> list[EvidenceDimension]:
         ("schema_application", "Schema applied"),
         ("data_preservation", "Data preserved"),
         ("legacy_queries", "Legacy queries"),
+        ("rollback_recovery", "Rollback recovery"),
         ("failure_recovery", "Failure recovery"),
         ("idempotent_retry", "Idempotent retry"),
     )
@@ -659,6 +788,168 @@ def empty_dimensions() -> list[EvidenceDimension]:
         )
         for key, label in definitions
     ]
+
+
+_IDENTIFIER = r'(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)'
+_TABLE_IDENTIFIER = rf'(?:{_IDENTIFIER}\.)?{_IDENTIFIER}'
+
+
+def _generate_inverse(
+    sandbox: PostgresSandbox, bundle: ProjectBundle
+) -> tuple[list[str], RecoveryClassification | None]:
+    inverse: list[str] = []
+    for policy_statement in reversed(bundle.candidate_statements):
+        statement = policy_statement.sql.strip()
+        add_column = re.match(
+            rf"^ALTER\s+TABLE\s+({_TABLE_IDENTIFIER})\s+ADD\s+(?:COLUMN\s+)?"
+            rf"(?:IF\s+NOT\s+EXISTS\s+)?({_IDENTIFIER})\b",
+            statement,
+            re.IGNORECASE,
+        )
+        if add_column:
+            inverse.append(
+                f"ALTER TABLE {add_column.group(1)} DROP COLUMN {add_column.group(2)}"
+            )
+            continue
+        create_index = re.match(
+            rf"^CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?({_TABLE_IDENTIFIER})\b",
+            statement,
+            re.IGNORECASE,
+        )
+        if create_index:
+            inverse.append(f"DROP INDEX {create_index.group(1)}")
+            continue
+        add_constraint = re.match(
+            rf"^ALTER\s+TABLE\s+({_TABLE_IDENTIFIER})\s+ADD\s+CONSTRAINT\s+({_IDENTIFIER})\b",
+            statement,
+            re.IGNORECASE,
+        )
+        if add_constraint:
+            inverse.append(
+                f"ALTER TABLE {add_constraint.group(1)} DROP CONSTRAINT {add_constraint.group(2)}"
+            )
+            continue
+        create_table = re.match(
+            rf"^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?({_TABLE_IDENTIFIER})\b",
+            statement,
+            re.IGNORECASE,
+        )
+        if create_table:
+            inverse.append(f"DROP TABLE {create_table.group(1)}")
+            continue
+        rename_column = re.match(
+            rf"^ALTER\s+TABLE\s+({_TABLE_IDENTIFIER})\s+RENAME\s+COLUMN\s+"
+            rf"({_IDENTIFIER})\s+TO\s+({_IDENTIFIER})\s*$",
+            statement,
+            re.IGNORECASE,
+        )
+        if rename_column:
+            inverse.append(
+                f"ALTER TABLE {rename_column.group(1)} RENAME COLUMN "
+                f"{rename_column.group(3)} TO {rename_column.group(2)}"
+            )
+            continue
+        rename_table = re.match(
+            rf"^ALTER\s+TABLE\s+({_TABLE_IDENTIFIER})\s+RENAME\s+TO\s+({_IDENTIFIER})\s*$",
+            statement,
+            re.IGNORECASE,
+        )
+        if rename_table:
+            old_name = rename_table.group(1).split(".")[-1]
+            inverse.append(
+                f"ALTER TABLE {rename_table.group(2)} RENAME TO {old_name}"
+            )
+            continue
+        set_not_null = re.match(
+            rf"^ALTER\s+TABLE\s+({_TABLE_IDENTIFIER})\s+ALTER\s+(?:COLUMN\s+)?"
+            rf"({_IDENTIFIER})\s+SET\s+NOT\s+NULL\s*$",
+            statement,
+            re.IGNORECASE,
+        )
+        if set_not_null:
+            inverse.append(
+                f"ALTER TABLE {set_not_null.group(1)} ALTER COLUMN "
+                f"{set_not_null.group(2)} DROP NOT NULL"
+            )
+            continue
+        set_default = re.match(
+            rf"^ALTER\s+TABLE\s+({_TABLE_IDENTIFIER})\s+ALTER\s+(?:COLUMN\s+)?"
+            rf"({_IDENTIFIER})\s+SET\s+DEFAULT\b",
+            statement,
+            re.IGNORECASE,
+        )
+        if set_default:
+            inverse.append(
+                f"ALTER TABLE {set_default.group(1)} ALTER COLUMN "
+                f"{set_default.group(2)} DROP DEFAULT"
+            )
+            continue
+        drop_column = re.match(
+            rf"^ALTER\s+TABLE\s+({_TABLE_IDENTIFIER})\s+DROP\s+(?:COLUMN\s+)?"
+            rf"(?:IF\s+EXISTS\s+)?({_IDENTIFIER})\b",
+            statement,
+            re.IGNORECASE,
+        )
+        if drop_column:
+            restore = _column_restore_sql(
+                sandbox, drop_column.group(1), drop_column.group(2)
+            )
+            if restore is None:
+                return [], RecoveryClassification.EXTERNALLY_RECOVERABLE_ONLY
+            inverse.extend(restore)
+            continue
+        if re.match(r"^(?:TRUNCATE|DROP\s+(?:TABLE|INDEX))\b", statement, re.IGNORECASE):
+            return [], RecoveryClassification.EXTERNALLY_RECOVERABLE_ONLY
+        return [], RecoveryClassification.NOT_APPLICABLE
+    if not inverse:
+        return [], RecoveryClassification.NOT_APPLICABLE
+    return inverse, None
+
+
+def _column_restore_sql(
+    sandbox: PostgresSandbox, table: str, column: str
+) -> list[str] | None:
+    table_literal = table.replace("'", "''")
+    column_name = column.strip('"')
+    column_literal = column_name.replace("'", "''")
+    metadata = sandbox.execute(
+        "SELECT format_type(a.atttypid, a.atttypmod) || '|' || "
+        "a.attnotnull::text || '|' || COALESCE(pg_get_expr(d.adbin, d.adrelid), '') "
+        "FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid "
+        "AND d.adnum = a.attnum "
+        f"WHERE a.attrelid = '{table_literal}'::regclass "
+        f"AND a.attname = '{column_literal}' AND NOT a.attisdropped"
+    )
+    if not metadata.succeeded or not metadata.output.strip():
+        return None
+    data_type, not_null, default = metadata.output.strip().split("|", 2)
+    add = f"ALTER TABLE {table} ADD COLUMN {column} {data_type}"
+    if default:
+        add += f" DEFAULT {default}"
+    statements = [add]
+    if not_null.lower() == "true" or not_null.lower() == "t":
+        if not default:
+            statements.append(
+                f"UPDATE {table} SET {column} = {_rollback_placeholder(data_type)} "
+                f"WHERE {column} IS NULL"
+            )
+        statements.append(f"ALTER TABLE {table} ALTER COLUMN {column} SET NOT NULL")
+    return statements
+
+
+def _rollback_placeholder(data_type: str) -> str:
+    normalized = data_type.lower()
+    if any(token in normalized for token in ("int", "numeric", "decimal", "real", "double")):
+        return "0"
+    if "bool" in normalized:
+        return "FALSE"
+    if "uuid" in normalized:
+        return "'00000000-0000-4000-8000-000000000000'"
+    if "timestamp" in normalized or normalized == "date":
+        return "CURRENT_TIMESTAMP"
+    if "json" in normalized:
+        return "'{}'"
+    return "'rollbackready-restored'"
 
 
 def _set_dimension(

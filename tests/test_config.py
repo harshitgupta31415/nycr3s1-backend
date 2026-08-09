@@ -49,10 +49,15 @@ def test_clerk_and_vertex_settings_are_parsed(monkeypatch) -> None:
         "CLERK_AUTHORIZED_PARTIES",
         "https://app.example.com, https://admin.example.com,",
     )
+    monkeypatch.setenv("CLERK_AUTH_MODE", "required")
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
     monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "global")
     monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
     monkeypatch.setenv("GEMINI_MODEL", "test-model")
+    monkeypatch.setenv(
+        "ROLLBACKREADY_PRIVILEGED_CLERK_USER_IDS",
+        "user_owner, user_demo,",
+    )
 
     configured = Settings.from_environment()
 
@@ -63,7 +68,11 @@ def test_clerk_and_vertex_settings_are_parsed(monkeypatch) -> None:
         "https://app.example.com",
         "https://admin.example.com",
     )
+    assert configured.clerk_auth_required is True
     assert configured.google_cloud_project == "test-project"
     assert configured.google_cloud_location == "global"
     assert configured.google_genai_use_vertexai is True
     assert configured.gemini_model == "test-model"
+    assert configured.rollbackready_privileged_clerk_user_ids == frozenset(
+        {"user_owner", "user_demo"}
+    )

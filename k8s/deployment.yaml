@@ -7,9 +7,14 @@ metadata:
     app.kubernetes.io/name: backend
     app.kubernetes.io/part-of: nycr3s1
 spec:
-  # Raw artifacts exist only in this process until the synchronous run/plan
-  # lifecycle ends, so the anonymous MVP deliberately uses one control pod.
+  # Raw artifacts are shared through a private, lifecycle-managed GCS bucket;
+  # sanitized state is coordinated through Cloud SQL, so replicas are safe.
   replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: backend
@@ -39,20 +44,50 @@ spec:
               value: "true"
             - name: GEMINI_MODEL
               value: gemini-3.6-flash
+            - name: GEMINI_API_KEY
+              value: "${GEMINI_API_KEY}"
             - name: ROLLBACKREADY_SANDBOX_BACKEND
               value: native
             - name: ROLLBACKREADY_POSTGRES_BIN
               value: /usr/lib/postgresql/18/bin
             - name: ROLLBACKREADY_PERSIST_REPORTS
               value: "true"
+            - name: ROLLBACKREADY_ARTIFACT_BUCKET
+              value: "${ARTIFACT_BUCKET}"
+            - name: ROLLBACKREADY_ARTIFACT_RETENTION_HOURS
+              value: "24"
             - name: ROLLBACKREADY_TOTAL_RUNTIME_SECONDS
               value: "90"
             - name: ROLLBACKREADY_MAX_TOTAL_ROWS
               value: "10000"
             - name: ROLLBACKREADY_MAX_ACTIVE_ANALYSES
-              value: "25"
+              value: "3"
             - name: ROLLBACKREADY_CREATE_RATE_LIMIT_PER_MINUTE
               value: "10"
+            - name: ROLLBACKREADY_PRIVILEGED_CLERK_USER_IDS
+              value: "${ROLLBACKREADY_PRIVILEGED_CLERK_USER_IDS}"
+            - name: CORS_ORIGIN
+              value: "${CORS_ORIGIN}"
+            - name: CLERK_AUTH_MODE
+              value: "required"
+            - name: CLERK_AUTH_REQUIRED
+              value: "true"
+            - name: CLERK_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: backend-auth-secrets
+                  key: CLERK_SECRET_KEY
+            - name: CLERK_JWT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: backend-auth-secrets
+                  key: CLERK_JWT_KEY
+            - name: CLERK_JWKS_URL
+              value: "${CLERK_JWKS_URL}"
+            - name: CLERK_ISSUER
+              value: "${CLERK_ISSUER}"
+            - name: CLERK_AUTHORIZED_PARTIES
+              value: "${CLERK_AUTHORIZED_PARTIES}"
           ports:
             - name: http
               containerPort: 8080

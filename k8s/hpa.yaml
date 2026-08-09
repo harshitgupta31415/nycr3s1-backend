@@ -8,10 +8,10 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: backend
-  # Phase 1 moves raw artifacts to isolated workers. Until then, keep the
-  # anonymous synchronous lifecycle on one control pod.
+  # Two warm replicas absorb normal traffic; the secondary GKE path can burst
+  # to twenty isolated simulator pods behind the L7 and L4 load balancers.
   minReplicas: 1
-  maxReplicas: 1
+  maxReplicas: 20
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 0

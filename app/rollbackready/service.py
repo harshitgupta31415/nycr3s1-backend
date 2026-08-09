@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from threading import RLock
+from threading import Condition, RLock
 from uuid import uuid4
 
 from app.core.config import settings
+from app.rollbackready.advisory import SchemaChangeAdvisor
 from app.rollbackready.artifacts import ArtifactStore, build_artifact_store
 from app.rollbackready.contracts import (
+    AIInsight,
     AnalysisStatus,
     AnalysisSummary,
     ArtifactManifest,
@@ -19,9 +22,12 @@ from app.rollbackready.contracts import (
     EvidenceLevel,
     EvidenceReport,
     EvidenceStatus,
+    InsightKind,
     PlanState,
     RecoveryPlan,
     RiskFinding,
+    SchemaChatRequest,
+    SchemaChatResponse,
     Severity,
     SimulationRun,
     TimelineEvent,
@@ -43,6 +49,19 @@ from app.rollbackready.sql import validate_sql_policy
 
 ANALYSIS_RETENTION = timedelta(hours=24)
 logger = logging.getLogger(__name__)
+TERMINAL_ANALYSIS_STATUSES = frozenset(
+    {
+        AnalysisStatus.INVALID,
+        AnalysisStatus.STATIC_ONLY,
+        AnalysisStatus.UNSAFE,
+        AnalysisStatus.CONDITIONAL,
+        AnalysisStatus.VERIFIED,
+        AnalysisStatus.PLAN_REJECTED,
+        AnalysisStatus.VERIFIED_PLAN,
+        AnalysisStatus.ERROR,
+        AnalysisStatus.EXPIRED,
+    }
+)
 
 
 @dataclass(slots=True)
@@ -67,6 +86,7 @@ class _Analysis:
     timeline: list[TimelineEvent] = field(default_factory=list)
     plans: list[RecoveryPlan] = field(default_factory=list)
     verifications: list[VerificationResult] = field(default_factory=list)
+    insights: list[AIInsight] = field(default_factory=list)
     limitations: list[str] = field(default_factory=list)
 
 
@@ -78,13 +98,16 @@ class AnalysisService:
         *,
         simulator: SimulationEngine | None = None,
         planner: RecoveryPlanner | None = None,
+        advisor: SchemaChangeAdvisor | None = None,
         repository: EvidenceRepository | None = None,
         artifact_store: ArtifactStore | None = None,
     ) -> None:
         self._analyses: dict[str, _Analysis] = {}
         self._lock = RLock()
+        self._event_condition = Condition(self._lock)
         self._simulator = simulator or SimulationEngine()
         self._planner = planner or RecoveryPlanner()
+        self._advisor = advisor or SchemaChangeAdvisor()
         self._repository = repository or build_evidence_repository()
         self._artifact_store = artifact_store or build_artifact_store()
         self._local_idempotency: dict[
@@ -114,6 +137,7 @@ class AnalysisService:
             created_at=now,
             updated_at=now,
             expires_at=now + ANALYSIS_RETENTION,
+            limitations=_input_limitations(bundle),
         )
         artifact: ArtifactReference | None = None
         if archive is not None:
@@ -144,7 +168,11 @@ class AnalysisService:
                 }
                 for item in self._analyses.values()
             )
-            if unfinished >= max(1, settings.rollbackready_max_unfinished_per_user):
+            if (
+                not settings.is_privileged_clerk_user(owner_clerk_user_id)
+                and unfinished
+                >= max(1, settings.rollbackready_max_unfinished_per_user)
+            ):
                 self._delete_artifact(record, mark_persisted=False)
                 raise RollbackReadyError(
                     "ANALYSIS_CAPACITY_REACHED",
@@ -188,7 +216,7 @@ class AnalysisService:
             record.status = AnalysisStatus.STATIC_ONLY
             record.verdict = Verdict.INSUFFICIENT_EVIDENCE
             record.evidence = empty_dimensions()
-            record.limitations = _missing_input_limitations(record.bundle)
+            record.limitations = _input_limitations(record.bundle)
             self._append_event(
                 record,
                 "SIMULATION_NOT_TESTED",
@@ -284,7 +312,26 @@ class AnalysisService:
     def timeline(
         self, analysis_id: str, owner_clerk_user_id: str
     ) -> list[TimelineEvent]:
-        return list(self._get_record(analysis_id, owner_clerk_user_id).timeline)
+        record = self._get_record(analysis_id, owner_clerk_user_id)
+        with self._lock:
+            return list(record.timeline)
+
+    def wait_for_timeline_events(
+        self,
+        analysis_id: str,
+        owner_clerk_user_id: str,
+        after_sequence: int,
+        timeout_seconds: float = 15.0,
+    ) -> tuple[list[TimelineEvent], AnalysisStatus]:
+        """Replay and wait for owner-scoped timeline events without busy polling."""
+        record = self._get_record(analysis_id, owner_clerk_user_id)
+        with self._event_condition:
+            self._event_condition.wait_for(
+                lambda: len(record.timeline) > after_sequence
+                or record.status in TERMINAL_ANALYSIS_STATUSES,
+                timeout=max(0.1, timeout_seconds),
+            )
+            return list(record.timeline[after_sequence:]), record.status
 
     def create_plan(
         self, analysis_id: str, owner_clerk_user_id: str
@@ -297,7 +344,10 @@ class AnalysisService:
                 status_code=409,
                 analysis_id=analysis_id,
             )
-        if len(record.plans) >= settings.rollbackready_max_plans_per_analysis:
+        if (
+            not settings.is_privileged_clerk_user(owner_clerk_user_id)
+            and len(record.plans) >= settings.rollbackready_max_plans_per_analysis
+        ):
             raise RollbackReadyError(
                 "PLAN_LIMIT_REACHED",
                 "This analysis has reached its recovery-plan limit.",
@@ -321,6 +371,110 @@ class AnalysisService:
         self._touch(record)
         self._persist(record, operation_token)
         return plan
+
+    def chat_schema_change(
+        self,
+        analysis_id: str,
+        request: SchemaChatRequest,
+        owner_clerk_user_id: str,
+    ) -> SchemaChatResponse:
+        record = self._get_record(analysis_id, owner_clerk_user_id)
+        if not record.findings:
+            raise RollbackReadyError(
+                "CHAT_CONTEXT_UNAVAILABLE",
+                "Run an analysis with at least one finding before starting a schema conversation.",
+                status_code=409,
+                analysis_id=analysis_id,
+            )
+        plan = record.plans[-1] if record.plans else None
+        return self._advisor.reply(analysis_id, request, record.findings, plan)
+
+    def create_insight(
+        self,
+        analysis_id: str,
+        kind: InsightKind,
+        owner_clerk_user_id: str,
+    ) -> AIInsight:
+        record = self._get_record(analysis_id, owner_clerk_user_id)
+        cached = next((item for item in record.insights if item.kind is kind), None)
+        if cached is not None:
+            return cached
+        if not record.findings:
+            raise RollbackReadyError(
+                "INSIGHT_CONTEXT_UNAVAILABLE",
+                "Run an analysis with findings before requesting AI insights.",
+                status_code=409,
+                analysis_id=analysis_id,
+            )
+
+        plan = record.plans[-1] if record.plans else None
+        if kind is InsightKind.FINDING_EXPLANATIONS:
+            message = (
+                "Explain each deterministic finding in plain language, preserving its finding ID, "
+                "and state the practical application impact without inventing database facts."
+            )
+            derived_from = [item.id for item in record.findings]
+        elif kind is InsightKind.MIGRATION_SUMMARY:
+            message = (
+                f"Write a concise pull-request summary for this migration. The verdict is {record.verdict}. "
+                "Use the safety phrase verified for human review and never say safe to deploy."
+            )
+            derived_from = [item.id for item in record.findings] + [
+                item.key for item in record.evidence
+            ]
+        else:
+            verification = next(
+                (
+                    item
+                    for item in reversed(record.verifications)
+                    if item.status is EvidenceStatus.FAIL
+                ),
+                None,
+            )
+            if verification is None:
+                raise RollbackReadyError(
+                    "PLAN_REJECTION_UNAVAILABLE",
+                    "A failed deterministic plan verification is required for this insight.",
+                    status_code=409,
+                    analysis_id=analysis_id,
+                )
+            failed = [
+                item for item in verification.dimensions if item.status is EvidenceStatus.FAIL
+            ]
+            message = (
+                "Explain why the recovery plan failed deterministic verification. Ground the answer "
+                "only in these failed evidence dimensions: "
+                + "; ".join(f"{item.key}: {item.summary}" for item in failed)
+            )
+            derived_from = [item.key for item in failed]
+
+        response = self._advisor.reply(
+            analysis_id,
+            SchemaChatRequest(message=message),
+            record.findings,
+            plan,
+        )
+        insight = AIInsight(
+            id=str(uuid4()),
+            analysis_id=analysis_id,
+            kind=kind,
+            content=_sanitize_insight_content(response.answer, set(derived_from)),
+            derived_from=derived_from,
+            provider=response.provider,
+            model=response.model,
+            prompt_template_version=response.prompt_template_version,
+            generated_at=datetime.now(UTC),
+        )
+        record.insights.append(insight)
+        self._append_event(
+            record,
+            "AI_INSIGHT_GENERATED",
+            "PASS",
+            f"A sanitized {kind.value} insight was generated and cached.",
+        )
+        self._touch(record)
+        self._persist(record)
+        return insight
 
     def verify_plan(
         self, analysis_id: str, plan_id: str, owner_clerk_user_id: str
@@ -589,6 +743,7 @@ class AnalysisService:
                 timeline=list(persisted.timeline),
                 plans=list(summary.plans),
                 verifications=list(summary.verification_results),
+                insights=list(summary.insights),
                 limitations=list(summary.limitations),
             )
             with self._lock:
@@ -673,6 +828,8 @@ class AnalysisService:
         client: str = "",
     ) -> None:
         del client
+        if settings.is_privileged_clerk_user(owner_clerk_user_id):
+            return
         scope = hashlib.sha256(owner_clerk_user_id.encode()).hexdigest()
         if not bool(getattr(self._repository, "authoritative", False)):
             now = time.monotonic()
@@ -713,6 +870,7 @@ class AnalysisService:
     def _summary(record: _Analysis) -> AnalysisSummary:
         return AnalysisSummary(
             id=record.id,
+            auth_mode=settings.clerk_auth_mode,
             status=record.status,
             evidence_level=record.evidence_level,
             verdict=record.verdict,
@@ -735,6 +893,7 @@ class AnalysisService:
             legacy_query_results=list(record.legacy_results),
             plans=list(record.plans),
             verification_results=list(record.verifications),
+            insights=list(record.insights),
             limitations=list(record.limitations),
         )
 
@@ -881,8 +1040,8 @@ class AnalysisService:
         if mark_persisted and marker is not None:
             marker(record.id, record.owner_clerk_user_id)
 
-    @staticmethod
     def _append_event(
+        self,
         record: _Analysis,
         event_type: str,
         status: object,
@@ -891,17 +1050,19 @@ class AnalysisService:
         run_id: str | None = None,
         statement_index: int | None = None,
     ) -> None:
-        record.timeline.append(
-            TimelineEvent(
-                sequence=len(record.timeline) + 1,
-                occurred_at=datetime.now(UTC),
-                event_type=event_type,
-                status=str(status),
-                message=message,
-                run_id=run_id,
-                statement_index=statement_index,
+        with self._event_condition:
+            record.timeline.append(
+                TimelineEvent(
+                    sequence=len(record.timeline) + 1,
+                    occurred_at=datetime.now(UTC),
+                    event_type=event_type,
+                    status=str(status),
+                    message=message,
+                    run_id=run_id,
+                    statement_index=statement_index,
+                )
             )
-        )
+            self._event_condition.notify_all()
 
 
 def _candidate_verdict(
@@ -929,6 +1090,28 @@ def _candidate_verdict(
     return Verdict.VERIFIED_FOR_REVIEW
 
 
+def _sanitize_insight_content(content: str, allowed_references: set[str]) -> str:
+    safe_language = re.sub(
+        r"\bsafe\s+to\s+deploy\b",
+        "verified for human review",
+        content,
+        flags=re.IGNORECASE,
+    )
+    cited_uuids = set(
+        re.findall(
+            r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
+            safe_language,
+            flags=re.IGNORECASE,
+        )
+    )
+    if cited_uuids - allowed_references:
+        return (
+            "The provider response cited evidence outside this analysis and was rejected. "
+            "Review the deterministic findings and evidence dimensions directly."
+        )
+    return safe_language
+
+
 def _status_for_verdict(verdict: Verdict) -> AnalysisStatus:
     return {
         Verdict.UNSAFE: AnalysisStatus.UNSAFE,
@@ -939,7 +1122,7 @@ def _status_for_verdict(verdict: Verdict) -> AnalysisStatus:
     }[verdict]
 
 
-def _missing_input_limitations(bundle: ProjectBundle) -> list[str]:
+def _input_limitations(bundle: ProjectBundle) -> list[str]:
     limitations: list[str] = []
     if bundle.manifest.provider != "postgresql":
         limitations.append("Only PostgreSQL Prisma projects can receive sandbox verification.")
@@ -951,6 +1134,14 @@ def _missing_input_limitations(bundle: ProjectBundle) -> list[str]:
         limitations.append("Synthetic rollbackready/seed.sql is missing.")
     if not bundle.legacy_queries:
         limitations.append("rollbackready/legacy-queries.json is missing or empty.")
+    if bundle.manifest.fixture_source == "synthesized":
+        limitations.append(
+            "Fixtures were synthesized deterministically from the pre-migration schema; business semantics remain unverified."
+        )
+    if bundle.manifest.legacy_query_source == "synthesized":
+        limitations.append(
+            "Legacy queries were synthesized from the pre-migration schema rather than captured from an application workload."
+        )
     return limitations
 
 

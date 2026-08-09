@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import zipfile
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -10,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from app.core.clerk_auth import get_clerk_user_id
 from app.main import create_app
+from app.rollbackready import service as service_module
 from app.rollbackready.artifacts import InMemoryArtifactStore
 from app.rollbackready.contracts import (
     AnalysisStatus,
@@ -20,6 +22,7 @@ from app.rollbackready.contracts import (
     PlanPhase,
     PlanState,
     RecoveryPlan,
+    SchemaChatResponse,
     Severity,
     Verdict,
 )
@@ -103,6 +106,19 @@ class _FakePlanner:
                     rollback_guidance="Use a forward fix if writes depend on the column.",
                 )
             ],
+        )
+
+
+class _FakeAdvisor:
+    def reply(self, analysis_id, request, findings, plan) -> SchemaChatResponse:
+        primary = findings[0]
+        return SchemaChatResponse(
+            analysis_id=analysis_id,
+            answer=f"{primary.affected_object}: {primary.reason}",
+            suggested_questions=["What should deploy first?"],
+            provider="deterministic-fallback",
+            model="deterministic-v1",
+            prompt_template_version="test-advisor-v1",
         )
 
 
@@ -327,6 +343,47 @@ def test_demo_endpoint_stages_without_accepting_a_production_url() -> None:
     body = response.json()
     assert body["provider"] == "postgresql"
     assert "database_url" not in body
+
+
+def test_schema_chat_and_migration_summary_routes_return_advisory_content() -> None:
+    service = AnalysisService(
+        simulator=_FakeSimulator(),
+        advisor=_FakeAdvisor(),
+        repository=NullEvidenceRepository(),
+        artifact_store=InMemoryArtifactStore(),
+    )
+    application = create_app(dict, service)
+    application.dependency_overrides[get_clerk_user_id] = lambda: OWNER_A
+    with TestClient(application) as client:
+        staged = client.post(
+            "/api/v1/analyses",
+            data={"use_demo": "true"},
+            headers={"Idempotency-Key": "advisor-create-key"},
+        )
+        analysis_id = staged.json()["id"]
+        completed = client.post(
+            f"/api/v1/analyses/{analysis_id}/run",
+            headers={"Idempotency-Key": "advisor-run-key"},
+        )
+        chat = client.post(
+            f"/api/v1/analyses/{analysis_id}/chat",
+            json={"message": "Explain the main issue briefly.", "history": []},
+        )
+        insight = client.post(
+            f"/api/v1/analyses/{analysis_id}/insights",
+            params={"kind": "migration_summary"},
+        )
+        refreshed = client.get(f"/api/v1/analyses/{analysis_id}")
+
+    assert completed.status_code == status.HTTP_200_OK
+    assert completed.json()["findings"]
+    assert chat.status_code == status.HTTP_200_OK
+    assert chat.json()["answer"]
+    assert chat.json()["provider"] == "deterministic-fallback"
+    assert insight.status_code == status.HTTP_201_CREATED
+    assert insight.json()["kind"] == "migration_summary"
+    assert insight.json()["content"]
+    assert len(refreshed.json()["insights"]) == 1
 
 
 def test_create_idempotency_replays_without_duplicate_analysis() -> None:
@@ -588,3 +645,29 @@ def test_analysis_create_rate_limit_returns_retry_header() -> None:
     assert responses[-1].status_code == status.HTTP_429_TOO_MANY_REQUESTS
     assert responses[-1].headers["retry-after"]
     assert responses[-1].json()["error"]["code"] == "RATE_LIMITED"
+
+
+def test_privileged_account_bypasses_create_rate_limit(monkeypatch) -> None:
+    monkeypatch.setattr(
+        service_module,
+        "settings",
+        replace(
+            service_module.settings,
+            rollbackready_privileged_clerk_user_ids=frozenset({OWNER_A}),
+        ),
+    )
+    application = create_app(dict)
+    application.dependency_overrides[get_clerk_user_id] = lambda: OWNER_A
+    with TestClient(application) as client:
+        responses = []
+        for index in range(12):
+            response = client.post(
+                "/api/v1/analyses",
+                data={"use_demo": "true"},
+                headers={"Idempotency-Key": f"privileged-key-{index:04d}"},
+            )
+            responses.append(response)
+            if response.status_code == status.HTTP_201_CREATED:
+                client.delete(f"/api/v1/analyses/{response.json()['id']}")
+
+    assert all(response.status_code == status.HTTP_201_CREATED for response in responses)
