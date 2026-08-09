@@ -10,6 +10,11 @@ spec:
   # Raw artifacts exist only in this process until the synchronous run/plan
   # lifecycle ends, so the anonymous MVP deliberately uses one control pod.
   replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: backend
