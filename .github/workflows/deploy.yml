@@ -147,11 +147,10 @@ jobs:
           last_error = None
           for _ in range(12):
               try:
-                  with urllib.request.urlopen(f"{base_url}/openapi.json", timeout=15) as response:
+                  with urllib.request.urlopen(f"{base_url}/health/ready", timeout=15) as response:
                       document = json.load(response)
-                  assert document["info"]["title"] == "RollbackReady API"
-                  assert document["info"]["version"] == "0.3.0"
-                  assert "/api/v1/analyses" in document["paths"]
+                  assert document["status"] == "ready"
+                  assert document["database"]["connected"] is True
                   break
               except Exception as exc:
                   last_error = exc
