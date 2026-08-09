@@ -53,6 +53,8 @@ spec:
               value: "25"
             - name: ROLLBACKREADY_CREATE_RATE_LIMIT_PER_MINUTE
               value: "10"
+            - name: CORS_ORIGIN
+              value: "${CORS_ORIGIN}"
             - name: CLERK_AUTH_MODE
               value: "required"
             - name: CLERK_AUTH_REQUIRED

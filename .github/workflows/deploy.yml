@@ -21,6 +21,7 @@ env:
   RUNTIME_SERVICE_ACCOUNT: ${{ vars.GCP_RUNTIME_SERVICE_ACCOUNT }}
   GKE_CLUSTER: ${{ vars.GCP_GKE_CLUSTER }}
   GKE_NAMESPACE: nyc-r3s1
+  CORS_ORIGIN: https://dbsentinal.get200.qd.je
   CLERK_AUTHORIZED_PARTIES: https://dbsentinal.get200.qd.je
   CLERK_ISSUER: https://clerk.dbsentinal.get200.qd.je
   CLERK_JWKS_URL: https://clerk.dbsentinal.get200.qd.je/.well-known/jwks.json
@@ -119,6 +120,7 @@ jobs:
             ROLLBACKREADY_MAX_TOTAL_ROWS=10000
             ROLLBACKREADY_MAX_ACTIVE_ANALYSES=25
             ROLLBACKREADY_CREATE_RATE_LIMIT_PER_MINUTE=10
+            CORS_ORIGIN=${{ env.CORS_ORIGIN }}
             CLERK_ISSUER=${{ env.CLERK_ISSUER }}
             CLERK_AUTHORIZED_PARTIES=${{ env.CLERK_AUTHORIZED_PARTIES }}
             CLERK_JWKS_URL=${{ env.CLERK_JWKS_URL }}
