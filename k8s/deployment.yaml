@@ -69,6 +69,8 @@ spec:
                   key: CLERK_JWT_KEY
             - name: CLERK_JWKS_URL
               value: "${CLERK_JWKS_URL}"
+            - name: CLERK_ISSUER
+              value: "${CLERK_ISSUER}"
             - name: CLERK_AUTHORIZED_PARTIES
               value: "${CLERK_AUTHORIZED_PARTIES}"
           ports:
