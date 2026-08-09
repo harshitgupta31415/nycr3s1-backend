@@ -21,6 +21,9 @@ env:
   RUNTIME_SERVICE_ACCOUNT: ${{ vars.GCP_RUNTIME_SERVICE_ACCOUNT }}
   GKE_CLUSTER: ${{ vars.GCP_GKE_CLUSTER }}
   GKE_NAMESPACE: nyc-r3s1
+  CLERK_AUTHORIZED_PARTIES: https://dbsentinal.get200.qd.je
+  CLERK_JWKS_URL: https://clerk.dbsentinal.get200.qd.je/.well-known/jwks.json
+  CLERK_JWT_KEY: "-----BEGIN PUBLIC KEY-----\\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAx7rzLr5CUc7gwuej16gO9JkM8Q4WN2hoB99Dep5MKQ1ODV9i0APwwlDowE5mkP38282HItL9P+75mNBUbN9r6LqPjOZAoQAUJ+ZOaAeSo+fFO5bH6pf8TInCr120Aoe5eWKF3Ns2bvMtromEBJx+bzgptzojIhOvRTTXkENozYEnuV7GW+EDDnBD4Em3d0xheL0pHqloPTO3eq34nfX30SyNza9jEwEzK2cO0FOl//cln+JzpMBcZyn/NGfzwDMk8wauX+d/m0JV9IRte43fTRICFWl4aPCuAjAFKbiO88DT4LTcDs7KvrlgWOrnQrS8OR5znUMBGfZANsMgs8GwIQIDAQAB\\n-----END PUBLIC KEY-----"
 
 jobs:
   test-and-deploy:
@@ -115,7 +118,12 @@ jobs:
             ROLLBACKREADY_MAX_TOTAL_ROWS=10000
             ROLLBACKREADY_MAX_ACTIVE_ANALYSES=25
             ROLLBACKREADY_CREATE_RATE_LIMIT_PER_MINUTE=10
-            CLERK_AUTH_REQUIRED=false
+            CLERK_SECRET_KEY=${{ secrets.CLERK_SECRET_KEY }}
+            CLERK_JWT_KEY=${{ env.CLERK_JWT_KEY }}
+            CLERK_AUTHORIZED_PARTIES=${{ env.CLERK_AUTHORIZED_PARTIES }}
+            CLERK_JWKS_URL=${{ env.CLERK_JWKS_URL }}
+            CLERK_AUTH_MODE=required
+            CLERK_AUTH_REQUIRED=true
           flags: >-
             --port=8080
             --service-account=${{ env.RUNTIME_SERVICE_ACCOUNT }}
@@ -153,11 +161,30 @@ jobs:
               raise SystemExit(f"deployed API did not become current: {last_error}")
           PY
 
+      - name: Bind Cloud Run Clerk secret from Secret Manager
+        shell: bash
+        run: |
+          gcloud run services update "${CLOUD_RUN_SERVICE}" \
+            --project="${PROJECT_ID}" \
+            --region="${REGION}" \
+            --remove-env-vars=CLERK_SECRET_KEY \
+            --update-secrets=CLERK_SECRET_KEY=nycr3s1-clerk-secret-key:latest \
+            --quiet
+
       - name: Deploy to GKE
         shell: bash
         env:
           IMAGE: ${{ steps.image.outputs.uri }}
+          CLERK_SECRET_KEY: ${{ secrets.CLERK_SECRET_KEY }}
+          CLERK_JWT_KEY: ${{ env.CLERK_JWT_KEY }}
+          CLERK_AUTHORIZED_PARTIES: ${{ env.CLERK_AUTHORIZED_PARTIES }}
+          CLERK_JWKS_URL: ${{ env.CLERK_JWKS_URL }}
         run: |
+          kubectl create secret generic backend-auth-secrets \
+            --namespace="$GKE_NAMESPACE" \
+            --from-literal=CLERK_SECRET_KEY="$CLERK_SECRET_KEY" \
+            --from-literal=CLERK_JWT_KEY="$CLERK_JWT_KEY" \
+            --dry-run=client --output=yaml | kubectl apply -f -
           envsubst < k8s/deployment.yaml | kubectl apply -f -
           kubectl apply -f k8s/backend-config.yaml
           kubectl apply \
