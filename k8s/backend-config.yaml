@@ -1,0 +1,20 @@
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: backend-ingress-config
+  namespace: nyc-r3s1
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: nycr3s1
+spec:
+  timeoutSec: 120
+  connectionDraining:
+    drainingTimeoutSec: 60
+  healthCheck:
+    checkIntervalSec: 10
+    timeoutSec: 5
+    healthyThreshold: 2
+    unhealthyThreshold: 3
+    type: HTTP
+    requestPath: /health/ready
+    port: 8080

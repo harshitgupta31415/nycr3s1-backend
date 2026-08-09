@@ -176,3 +176,13 @@ Verification:
 Ruff passed and all 42 backend tests passed. Built the exact non-root Linux production image with PostgreSQL 18 and ran the complete built-in unsafe-phone candidate plus deterministic LangGraph recovery plan inside it. The candidate remained UNSAFE with all seven evidence dimensions, and the fresh-baseline plan verification returned VERIFIED_FOR_REVIEW/PASS.
 Deployment:
 The correction is prepared on codex/gke-https-runtime-fix for a gated pull request. The currently deployed 82f9b10 revision still requires this correction before the live built-in demo can complete.
+
+[2026-08-09 17:05:00 IST]
+Task:
+Add and verify TLS for api.r3.get200.qd.je on GKE without blindly replacing the working backend or mounting certificates in application Pods.
+Changes:
+Reserved global address nycr3s1-api-r3-ingress-ip (34.102.128.181), added a dedicated NEG-backed ClusterIP Service, a BackendConfig with a /health/ready probe and 120-second request timeout, and a host-scoped GCE Ingress. The initial ManagedCertificate plus HTTP/HTTPS design exposed the project-wide IN_USE_ADDRESSES quota of 4 before DNS cutover. Preserved the existing regional L4 backend-public Service as rollback and moved to a quota-safe HTTPS-only Ingress using the Google-managed Compute certificate api-r3-compute-ssl-cert. The API A record now points to 34.102.128.181. No certificate key is stored in Kubernetes or the application image.
+Verification:
+All manifests passed Kubernetes server-side dry-run and the deployment workflow plus every k8s YAML parsed successfully. Before the HTTPS transition, direct-IP and public-domain /health/ready checks returned HTTP 200 with the database connected. The final NEG backend is HEALTHY, the static address is attached to a port-443 forwarding rule, and the Compute certificate is attached to the GKE target HTTPS proxy. Certificate issuance remains PROVISIONING and must reach ACTIVE before SSL is considered verified.
+Deployment:
+The new HTTPS-only Ingress is live at the load-balancer control plane while Google completes certificate issuance. The existing L4 Service and regional reserved IP remain recoverable and were not deleted. The unused ManagedCertificate object created during the first design pass remains eligible for cleanup after the final certificate is active.
