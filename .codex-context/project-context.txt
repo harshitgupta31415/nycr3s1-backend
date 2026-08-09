@@ -186,3 +186,11 @@ Verification:
 All manifests passed Kubernetes server-side dry-run and the deployment workflow plus every k8s YAML parsed successfully. Before the HTTPS transition, direct-IP and public-domain /health/ready checks returned HTTP 200 with the database connected. The final NEG backend is HEALTHY, the static address is attached to a port-443 forwarding rule, and the Compute certificate is attached to the GKE target HTTPS proxy. Certificate issuance remains PROVISIONING and must reach ACTIVE before SSL is considered verified.
 Deployment:
 The new HTTPS-only Ingress is live at the load-balancer control plane while Google completes certificate issuance. The existing L4 Service and regional reserved IP remain recoverable and were not deleted. The unused ManagedCertificate object created during the first design pass remains eligible for cleanup after the final certificate is active.
+
+[2026-08-09 17:15:00 IST]
+Task:
+Complete strict SSL verification and clean the abandoned first-pass certificate without changing the working rollback service.
+Verification:
+Google-managed Compute certificate api-r3-compute-ssl-cert reached ACTIVE. A strict system-trust TLS handshake (no insecure bypass) negotiated TLS 1.3, presented CN/SAN api.r3.get200.qd.je, was issued by Google Trust Services WR3, and expires 2026-11-07. Public HTTPS requests to /health, /health/ready, /health/database, and /openapi.json all returned 200; readiness and database checks reported connected, and OpenAPI identified RollbackReady API 0.3.0 with the analysis route.
+Deployment:
+api.r3.get200.qd.je resolves publicly to 34.102.128.181 and is serving verified HTTPS through the GKE Application Load Balancer. The superseded L4 Service at 34.100.156.113 remains available as rollback. Deleted only the unused first-pass ManagedCertificate; the active API certificate and existing frontend certificate are the only global managed SSL certificates left. Production application deployment still requires explicit approval to merge PR #2 because the merge triggers GitHub Actions, Cloud Run, and GKE rollout.
