@@ -54,12 +54,12 @@ class PostgresSandbox:
         self._deadline = time.monotonic() + max(
             1, settings.rollbackready_total_runtime_seconds
         )
+        self._binaries: dict[str, str] = {}
         self._backend = self._resolve_backend()
         self._root: Path | None = None
         self._data: Path | None = None
         self._socket: Path | None = None
         self._container: str | None = None
-        self._binaries: dict[str, str] = {}
         self._started = False
 
     def __enter__(self) -> Self:
@@ -161,6 +161,8 @@ class PostgresSandbox:
                 str(self._data),
                 "--wait",
                 "--timeout=30",
+                "--log",
+                str(self._root / "postgres.log"),
                 "--options",
                 options,
                 "--silent",

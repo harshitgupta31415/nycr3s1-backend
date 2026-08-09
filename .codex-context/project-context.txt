@@ -159,10 +159,38 @@ The direct origin/main push is explicitly authorized by the user. This release c
 
 [2026-08-09 16:08:18 IST]
 Task:
-Diagnose and repair the failed backend production workflow, then republish the focused correction to origin/main under the user's existing authorization.
+Diagnose and repair the failed backend production workflow, then publish the focused correction through a gated hotfix pull request.
 Changes:
 GitHub Actions run 31308375278 showed that migration 0003 created its tables transactionally but failed while updating alembic_version because revision ID 0003_create_rollbackready_evidence exceeded the existing VARCHAR(32) column. Shortened the revision to 0003_rollbackready_evidence, updated the dependent migration, and added a regression assertion that every Alembic revision ID fits the 32-character database limit.
 Verification:
-Ruff passed and all 41 backend tests passed after the correction. The failed production transaction left alembic_version at 0002, so the corrected 0003 migration remains safe to retry as a complete transactional upgrade.
+Ruff passed and all 40 backend tests passed after the reconciled correction. A clean PostgreSQL 18 container upgraded from 0002 through head with the standard VARCHAR(32) Alembic version column, downgraded to 0002, and upgraded through head again. The failed production transaction left alembic_version at 0002, so the corrected 0003 migration remains safe to retry as a complete transactional upgrade. The disposable test container was removed.
 Deployment:
-The first explicitly authorized main deployment stopped before Cloud Run/GKE rollout at the migration gate. The corrective commit is authorized for direct origin/main push and must be monitored through migration, Cloud Run OpenAPI verification, and GKE rollout.
+The merge-triggered deployment stopped before Cloud Run/GKE rollout at the migration gate. Publish the corrective commit on a hotfix branch and keep the main merge/deployment gated; after merge, monitor migration, Cloud Run OpenAPI verification, and GKE rollout.
+
+[2026-08-09 16:48:00 IST]
+Task:
+Repair the production-native PostgreSQL sandbox failure discovered by the live built-in demo before continuing the HTTPS rollout.
+Changes:
+Preserved PostgreSQL binary paths resolved during PostgresSandbox construction instead of clearing them after backend selection. Redirected the detached postgres server output to the sandbox-local postgres.log so pg_ctl does not keep subprocess capture pipes open and cause a false 90-second startup timeout. Added focused regression coverage for both runtime failures.
+Verification:
+Ruff passed and all 42 backend tests passed. Built the exact non-root Linux production image with PostgreSQL 18 and ran the complete built-in unsafe-phone candidate plus deterministic LangGraph recovery plan inside it. The candidate remained UNSAFE with all seven evidence dimensions, and the fresh-baseline plan verification returned VERIFIED_FOR_REVIEW/PASS.
+Deployment:
+The correction is prepared on codex/gke-https-runtime-fix for a gated pull request. The currently deployed 82f9b10 revision still requires this correction before the live built-in demo can complete.
+
+[2026-08-09 17:05:00 IST]
+Task:
+Add and verify TLS for api.r3.get200.qd.je on GKE without blindly replacing the working backend or mounting certificates in application Pods.
+Changes:
+Reserved global address nycr3s1-api-r3-ingress-ip (34.102.128.181), added a dedicated NEG-backed ClusterIP Service, a BackendConfig with a /health/ready probe and 120-second request timeout, and a host-scoped GCE Ingress. The initial ManagedCertificate plus HTTP/HTTPS design exposed the project-wide IN_USE_ADDRESSES quota of 4 before DNS cutover. Preserved the existing regional L4 backend-public Service as rollback and moved to a quota-safe HTTPS-only Ingress using the Google-managed Compute certificate api-r3-compute-ssl-cert. The API A record now points to 34.102.128.181. No certificate key is stored in Kubernetes or the application image.
+Verification:
+All manifests passed Kubernetes server-side dry-run and the deployment workflow plus every k8s YAML parsed successfully. Before the HTTPS transition, direct-IP and public-domain /health/ready checks returned HTTP 200 with the database connected. The final NEG backend is HEALTHY, the static address is attached to a port-443 forwarding rule, and the Compute certificate is attached to the GKE target HTTPS proxy. Certificate issuance remains PROVISIONING and must reach ACTIVE before SSL is considered verified.
+Deployment:
+The new HTTPS-only Ingress is live at the load-balancer control plane while Google completes certificate issuance. The existing L4 Service and regional reserved IP remain recoverable and were not deleted. The unused ManagedCertificate object created during the first design pass remains eligible for cleanup after the final certificate is active.
+
+[2026-08-09 17:15:00 IST]
+Task:
+Complete strict SSL verification and clean the abandoned first-pass certificate without changing the working rollback service.
+Verification:
+Google-managed Compute certificate api-r3-compute-ssl-cert reached ACTIVE. A strict system-trust TLS handshake (no insecure bypass) negotiated TLS 1.3, presented CN/SAN api.r3.get200.qd.je, was issued by Google Trust Services WR3, and expires 2026-11-07. Public HTTPS requests to /health, /health/ready, /health/database, and /openapi.json all returned 200; readiness and database checks reported connected, and OpenAPI identified RollbackReady API 0.3.0 with the analysis route.
+Deployment:
+api.r3.get200.qd.je resolves publicly to 34.102.128.181 and is serving verified HTTPS through the GKE Application Load Balancer. The superseded L4 Service at 34.100.156.113 remains available as rollback. Deleted only the unused first-pass ManagedCertificate; the active API certificate and existing frontend certificate are the only global managed SSL certificates left. Production application deployment still requires explicit approval to merge PR #2 because the merge triggers GitHub Actions, Cloud Run, and GKE rollout.

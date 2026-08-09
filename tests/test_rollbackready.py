@@ -26,6 +26,7 @@ from app.rollbackready.errors import RollbackReadyError
 from app.rollbackready.intake import load_demo_bundle, load_project_bundle
 from app.rollbackready.persistence import NullEvidenceRepository
 from app.rollbackready.risk import analyze_risks
+from app.rollbackready.sandbox import PostgresSandbox
 from app.rollbackready.service import AnalysisService
 from app.rollbackready.simulation import SimulationOutcome, empty_dimensions
 from app.rollbackready.sql import redact_sql, split_sql, validate_sql_policy
@@ -131,6 +132,60 @@ def test_demo_bundle_has_complete_postgresql_evidence() -> None:
     assert bundle.evidence_level is EvidenceLevel.SANDBOX_SIMULATED
     assert len(bundle.prior_migrations) == 1
     assert len(bundle.legacy_queries) == 2
+
+
+def test_native_sandbox_keeps_binaries_resolved_during_initialization(
+    monkeypatch,
+) -> None:
+    resolved = {
+        "initdb": "/postgres/bin/initdb",
+        "pg_ctl": "/postgres/bin/pg_ctl",
+        "psql": "/postgres/bin/psql",
+    }
+
+    def resolve_backend(sandbox: PostgresSandbox) -> str:
+        sandbox._binaries = resolved.copy()
+        return "native"
+
+    monkeypatch.setattr(PostgresSandbox, "_resolve_backend", resolve_backend)
+
+    sandbox = PostgresSandbox("native-runtime-regression")
+
+    assert sandbox._backend == "native"
+    assert sandbox._binaries == resolved
+
+
+def test_native_sandbox_redirects_postgres_server_output(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    resolved = {
+        "initdb": "/postgres/bin/initdb",
+        "pg_ctl": "/postgres/bin/pg_ctl",
+        "psql": "/postgres/bin/psql",
+    }
+
+    def resolve_backend(sandbox: PostgresSandbox) -> str:
+        sandbox._binaries = resolved.copy()
+        return "native"
+
+    root = tmp_path / "sandbox"
+    root.mkdir()
+    commands: list[list[str]] = []
+    monkeypatch.setattr(PostgresSandbox, "_resolve_backend", resolve_backend)
+    monkeypatch.setattr(
+        "app.rollbackready.sandbox.tempfile.mkdtemp",
+        lambda **_: str(root),
+    )
+
+    sandbox = PostgresSandbox("native-log-regression")
+    monkeypatch.setattr(sandbox, "_run", lambda command: commands.append(command))
+
+    sandbox._start_native()
+
+    pg_ctl = commands[1]
+    log_index = pg_ctl.index("--log")
+    assert pg_ctl[log_index + 1] == str(root / "postgres.log")
 
 
 def test_unsafe_phone_demo_matches_constraint_and_compatibility_rules() -> None:

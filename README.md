@@ -8,7 +8,8 @@ and persists only sanitized reports.
 ## Endpoints
 
 - Cloud Run (stable HTTPS): `https://nycr3s1-backend-s2tvvhxdpa-el.a.run.app`
-- GKE Autopilot load balancer: `http://34.100.156.113`
+- GKE Autopilot HTTPS Ingress: `https://api.r3.get200.qd.je`
+- GKE regional L4 rollback endpoint: `http://34.100.156.113`
 
 - `GET /` - service identity and readiness
 - `GET /health` - health check
@@ -97,6 +98,15 @@ remain process-local during the analysis lifecycle. The HPA is pinned to one
 replica until Phase 1 moves simulations to isolated workers with durable,
 encrypted temporary artifact storage. The public Service retains the reserved
 regional address `nycr3s1-gke-backend-ip`.
+
+The production API domain terminates TLS at a GKE external Application Load
+Balancer using the Google-managed Compute certificate
+`api-r3-compute-ssl-cert`. The HTTPS-only Ingress uses the reserved global
+address `nycr3s1-api-r3-ingress-ip`, a container-native NEG, and an explicit
+`/health/ready` health check. Pods continue to serve plain HTTP on port 8080
+inside the cluster; no private certificate material is mounted into application
+containers. The regional L4 Service remains available as an independent
+rollback path.
 
 ## Structure
 

@@ -159,7 +159,12 @@ jobs:
           IMAGE: ${{ steps.image.outputs.uri }}
         run: |
           envsubst < k8s/deployment.yaml | kubectl apply -f -
-          kubectl apply -f k8s/service.yaml -f k8s/hpa.yaml
+          kubectl apply -f k8s/backend-config.yaml
+          kubectl apply \
+            -f k8s/service.yaml \
+            -f k8s/ingress-service.yaml \
+            -f k8s/hpa.yaml
+          kubectl apply -f k8s/ingress.yaml
           kubectl rollout status deployment/backend \
             --namespace="$GKE_NAMESPACE" --timeout=300s
 
@@ -172,9 +177,17 @@ jobs:
               --namespace="$GKE_NAMESPACE" \
               --output=jsonpath='{.status.loadBalancer.ingress[0].ip}')"
             if [[ -n "$GKE_IP" ]]; then
-              echo "GKE URL - http://$GKE_IP" >> "$GITHUB_STEP_SUMMARY"
-              exit 0
+              echo "GKE rollback URL - http://$GKE_IP" >> "$GITHUB_STEP_SUMMARY"
+              break
             fi
             sleep 5
           done
-          echo "GKE load balancer IP is still provisioning." >> "$GITHUB_STEP_SUMMARY"
+          INGRESS_IP="$(kubectl get ingress backend-ingress \
+            --namespace="$GKE_NAMESPACE" \
+            --output=jsonpath='{.status.loadBalancer.ingress[0].ip}')"
+          if [[ -n "$INGRESS_IP" ]]; then
+            echo "GKE HTTPS URL - https://api.r3.get200.qd.je ($INGRESS_IP)" \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "GKE HTTPS Ingress is still reconciling." >> "$GITHUB_STEP_SUMMARY"
+          fi

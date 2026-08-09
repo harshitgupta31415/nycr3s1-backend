@@ -1,0 +1,25 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: backend-ingress
+  namespace: nyc-r3s1
+  annotations:
+    ingress.gcp.kubernetes.io/pre-shared-cert: api-r3-compute-ssl-cert
+    kubernetes.io/ingress.class: "gce"
+    kubernetes.io/ingress.allow-http: "false"
+    kubernetes.io/ingress.global-static-ip-name: nycr3s1-api-r3-ingress-ip
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: nycr3s1
+spec:
+  rules:
+    - host: api.r3.get200.qd.je
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: backend-ingress
+                port:
+                  name: http
