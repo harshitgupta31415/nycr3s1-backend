@@ -124,3 +124,13 @@ Known production limitation:
 Raw verification artifacts remain process-local by design. Single-instance deployment settings reduce mid-lifecycle routing risk, but a container or pod replacement can still interrupt a staged or unverified analysis. Restart-safe asynchronous workers and encrypted temporary artifact storage remain roadmap work and the MVP must not be described as production-ready.
 Commit:
 NOT COMMITTED OR GIT-PUSHED. Both .codex-context logs remain intentionally unignored, neither log was added to .gitignore, and no .gitignore file was changed.
+
+[2026-08-09 15:32:44 IST]
+Task:
+Create a remote checkpoint before continuing RollbackReady work and add safe pull-request validation for the backend.
+Changes:
+Created branch codex/rollbackready-mvp, committed the verified backend MVP as 101e8c4, pushed the branch, and opened draft PR https://github.com/harshitgupta31415/nycr3s1-backend/pull/1. Added a separate backend CI workflow for pull requests and non-main branches; it runs dependency checks, compileall, Ruff, and Pytest and has no cloud authentication or deployment steps.
+Verification:
+The committed branch exactly matched origin/codex/rollbackready-mvp and the worktree was clean before continued work. The initial checkpoint retained the previously verified 40 passing tests and real PostgreSQL/browser evidence. The new workflow is intentionally isolated from the production deployment workflow.
+Deployment:
+No merge, production deployment, infrastructure mutation, or production database access was performed.
