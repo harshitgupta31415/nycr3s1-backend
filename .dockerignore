@@ -1,0 +1,10 @@
+.git
+.github
+.venv
+__pycache__
+.pytest_cache
+*.py[cod]
+.env
+.env.*
+gha-creds-*.json
+tests

@@ -1,0 +1,58 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: backend-migrate
+  namespace: nyc-r3s1
+  labels:
+    app.kubernetes.io/name: backend-migrate
+    app.kubernetes.io/part-of: nycr3s1
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: backend-migrate
+        app.kubernetes.io/part-of: nycr3s1
+    spec:
+      serviceAccountName: backend
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: ${IMAGE}
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "alembic", "upgrade", "head"]
+          env:
+            - name: INSTANCE_CONNECTION_NAME
+              value: nychacksishv-core-20260808:asia-south1:nycr3s1-postgres
+            - name: IAM_DB_USER
+              value: nycr3s1-backend-runtime@nychacksishv-core-20260808.iam
+            - name: DB_NAME
+              value: app
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+              ephemeral-storage: 1Gi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+              ephemeral-storage: 1Gi
+          volumeMounts:
+            - name: temporary-files
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+      volumes:
+        - name: temporary-files
+          emptyDir:
+            sizeLimit: 64Mi
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault

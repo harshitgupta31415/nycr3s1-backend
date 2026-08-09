@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: nyc-r3s1
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: nycr3s1
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: backend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: backend
+        app.kubernetes.io/part-of: nycr3s1
+    spec:
+      serviceAccountName: backend
+      containers:
+        - name: backend
+          image: ${IMAGE}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: INSTANCE_CONNECTION_NAME
+              value: nychacksishv-core-20260808:asia-south1:nycr3s1-postgres
+            - name: IAM_DB_USER
+              value: nycr3s1-backend-runtime@nychacksishv-core-20260808.iam
+            - name: DB_NAME
+              value: app
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+              ephemeral-storage: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+              ephemeral-storage: 512Mi
+          volumeMounts:
+            - name: temporary-files
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+      volumes:
+        - name: temporary-files
+          emptyDir:
+            sizeLimit: 64Mi
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault

@@ -1,0 +1,6 @@
+fastapi==0.141.1
+uvicorn[standard]==0.52.1
+alembic==1.19.0
+cloud-sql-python-connector[pg8000]==1.20.4
+pg8000==1.31.5
+SQLAlchemy==2.0.51

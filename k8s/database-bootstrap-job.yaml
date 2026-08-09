@@ -1,0 +1,89 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: database-bootstrap
+  namespace: nyc-r3s1
+  labels:
+    app.kubernetes.io/name: database-bootstrap
+    app.kubernetes.io/part-of: nycr3s1
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: database-bootstrap
+        app.kubernetes.io/part-of: nycr3s1
+    spec:
+      serviceAccountName: backend
+      restartPolicy: Never
+      containers:
+        - name: bootstrap
+          image: ${IMAGE}
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-c"]
+          args:
+            - |
+              import os
+
+              from google.cloud.sql.connector import Connector
+
+              runtime_user = os.environ["IAM_DB_USER"].replace('"', '""')
+              connector = Connector()
+              connection = connector.connect(
+                  os.environ["INSTANCE_CONNECTION_NAME"],
+                  "pg8000",
+                  user="postgres",
+                  password=os.environ["DB_ADMIN_PASSWORD"],
+                  db="app",
+                  timeout=10,
+              )
+              connection.autocommit = True
+              cursor = connection.cursor()
+              cursor.execute(
+                  f'GRANT CONNECT, CREATE ON DATABASE app TO "{runtime_user}"'
+              )
+              cursor.execute(
+                  f'GRANT USAGE, CREATE ON SCHEMA public TO "{runtime_user}"'
+              )
+              cursor.close()
+              connection.close()
+              connector.close()
+              print("Database bootstrap grants applied.")
+          env:
+            - name: INSTANCE_CONNECTION_NAME
+              value: nychacksishv-core-20260808:asia-south1:nycr3s1-postgres
+            - name: IAM_DB_USER
+              value: nycr3s1-backend-runtime@nychacksishv-core-20260808.iam
+            - name: DB_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: database-bootstrap
+                  key: password
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+              ephemeral-storage: 1Gi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+              ephemeral-storage: 1Gi
+          volumeMounts:
+            - name: temporary-files
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+      volumes:
+        - name: temporary-files
+          emptyDir:
+            sizeLimit: 64Mi
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
