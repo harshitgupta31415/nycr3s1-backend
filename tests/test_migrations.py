@@ -52,14 +52,18 @@ def test_rollbackready_revision_is_the_alembic_head() -> None:
     scripts = ScriptDirectory.from_config(config)
     revision = scripts.get_revision("0002_create_users")
 
+    evidence_revision = scripts.get_revision("0003_rollbackready_evidence")
     ownership_revision = scripts.get_revision("0004_add_analysis_ownership")
     statement_revision = scripts.get_revision("0005_add_statement_evidence")
 
     assert scripts.get_current_head() == "0005_add_statement_evidence"
+    assert all(len(item.revision) <= 32 for item in scripts.walk_revisions())
     assert revision is not None
     assert revision.down_revision == "0001_create_app_schema"
+    assert evidence_revision is not None
+    assert evidence_revision.down_revision == "0002_create_users"
     assert ownership_revision is not None
-    assert ownership_revision.down_revision == "0003_create_rollbackready_evidence"
+    assert ownership_revision.down_revision == "0003_rollbackready_evidence"
     assert statement_revision is not None
     assert statement_revision.down_revision == "0004_add_analysis_ownership"
 

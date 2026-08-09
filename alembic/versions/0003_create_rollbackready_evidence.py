@@ -1,6 +1,6 @@
 """Create sanitized RollbackReady evidence tables.
 
-Revision ID: 0003_create_rollbackready_evidence
+Revision ID: 0003_rollbackready_evidence
 Revises: 0002_create_users
 Create Date: 2026-08-09
 """
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision: str = "0003_create_rollbackready_evidence"
+revision: str = "0003_rollbackready_evidence"
 down_revision: str | None = "0002_create_users"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None

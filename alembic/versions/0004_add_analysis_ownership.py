@@ -1,7 +1,7 @@
 """Add Clerk ownership to RollbackReady analyses.
 
 Revision ID: 0004_add_analysis_ownership
-Revises: 0003_create_rollbackready_evidence
+Revises: 0003_rollbackready_evidence
 Create Date: 2026-08-09
 """
 
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0004_add_analysis_ownership"
-down_revision: str | None = "0003_create_rollbackready_evidence"
+down_revision: str | None = "0003_rollbackready_evidence"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
