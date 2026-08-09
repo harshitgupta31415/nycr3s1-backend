@@ -34,6 +34,7 @@ class AnalysisRecord(Base):
     manifest: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     evidence: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False)
     limitations: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    ai_insights: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
