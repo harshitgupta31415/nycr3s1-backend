@@ -5,6 +5,20 @@ untrusted project archives, applies deterministic risk rules, runs disposable
 PostgreSQL 18 simulations, orchestrates a constrained LangGraph recovery planner,
 and persists only sanitized reports.
 
+## Hackathon alignment
+
+This backend is designed for the **Build What Survives Failure** engineering track.
+
+The goal is to keep proving migration safety under degraded conditions by:
+
+- handling interrupted execution and retry outcomes without halting the analysis flow,
+- continuing with deterministic checks when external services are degraded,
+- capturing actionable, sanitized evidence for each failure/recovery path,
+- requiring independent verification from a clean sandbox before promoting safer plans.
+
+This keeps the output human-reviewable and evidence-first, even when things do not
+run perfectly end-to-end.
+
 ## Endpoints
 
 - Cloud Run (stable HTTPS): `https://nycr3s1-backend-s2tvvhxdpa-el.a.run.app`
