@@ -8,10 +8,10 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: backend
-  # Two warm replicas absorb normal traffic; the secondary GKE path can burst
-  # to twenty isolated simulator pods behind the L7 and L4 load balancers.
+  # Keep one warm replica for normal traffic; GKE Autopilot can add managed
+  # capacity as demand grows, up to one hundred backend pods.
   minReplicas: 1
-  maxReplicas: 20
+  maxReplicas: 100
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 0
